@@ -808,6 +808,9 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         val s = 1000.0 / max(h, w)
         val small = Mat()
         Imgproc.resize(img, small, Size((w * s).roundToInt().toDouble(), (h * s).roundToInt().toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
+        // 종이 결·잡티의 밝은 점이 배경을 실제보다 밝게 끌어올리지 않도록 살짝 흐린 뒤 배경을 잰다
+        // (안 그러면 그림자 진 곳의 종이가 회색으로 남아 뒷면 비침과 구분이 안 됨)
+        Imgproc.GaussianBlur(small, small, Size(0.0, 0.0), FLAT_PREBLUR)
         val k = max(15, (max(small.rows(), small.cols()) * 0.035).toInt()) or 1
         val bg = Mat()
         Imgproc.morphologyEx(small, bg, Imgproc.MORPH_CLOSE, ellipse(k)) // 글자(어두운 것) 제거
@@ -867,7 +870,6 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         Imgproc.dilate(ink, keep, ellipse(2 * r + 1))
         ink.release()
         Imgproc.dilate(lines, tmp8, ellipse(5))
-        lines.release()
         Core.bitwise_or(keep, tmp8, keep)
         if (color) {
             val lab = Mat()
@@ -910,13 +912,22 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         val white8 = Mat()
         white.convertTo(white8, CvType.CV_8U)
         white.release()
-        // y = BLACK_OUT + (255 - BLACK_OUT) * (t²(3 - 2t))^gamma
-        // S자 곡선(부드러운 계단) 뒤 감마: 글자 심은 진하게, 글자 둘레의 옅은 얼룩·비침은 흰색 쪽으로
+        // 곡선: 감마(글자 진하게)와 S자 곡선 t²(3-2t)(글자 둘레의 옅은 얼룩·비침을 흰색 쪽으로)을 섞는다.
+        // 상자 테두리·밑줄 같은 옅은 긴 선 위에서는 S자를 쓰지 않는다(옅은 선이 사라지지 않게).
+        //   sm = S_MIX * (1 - blur(dilate(lines)))  ;  u = t + sm * (S(t) - t)
+        val sm = Mat()
+        Imgproc.dilate(lines, tmp8, rectK(3, 3))
+        lines.release()
+        tmp8.convertTo(sm, CvType.CV_32F, -S_MIX / 255.0, S_MIX)
+        Imgproc.GaussianBlur(sm, sm, Size(0.0, 0.0), 1.0)
         val u = Mat()
         t.convertTo(u, CvType.CV_32F, -2.0, 3.0)
         Core.multiply(u, t, u)
-        Core.multiply(u, t, t)
-        u.release()
+        Core.multiply(u, t, u)        // S(t)
+        Core.subtract(u, t, u)        // S(t) - t
+        Core.multiply(u, sm, u)
+        Core.add(t, u, t)
+        u.release(); sm.release()
         Core.pow(t, TONE_GAMMA, t)
         t.convertTo(t, CvType.CV_32F, 255.0 - BLACK_OUT, BLACK_OUT)
         val out = Mat()
@@ -1235,18 +1246,20 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
 
         // ---- 화질 보정(톤): engine/bookscan.py 의 같은 이름 상수
         const val PAPER_PCT = 60.0      // 종이 밝기 = 조명 평탄화 후 밝기의 이 백분위
-        const val WHITE_TEXT = 0.93     // 글자 근처의 흰색 기준(종이 밝기 대비): 글자 가장자리의 부드러운 회색을 살림
-        const val WHITE_BG = 0.83       // 글자에서 떨어진 곳의 흰색 기준: 뒷면 비침·종이 결을 지움
+        const val WHITE_TEXT = 0.95     // 글자 근처의 흰색 기준(종이 밝기 대비): 글자 가장자리의 부드러운 회색을 살림
+        const val WHITE_BG = 0.86       // 글자에서 떨어진 곳의 흰색 기준: 뒷면 비침·종이 결을 지움
         const val INK_DARK = 0.62       // 종이 밝기의 이 배보다 어두우면 확실한 글자(인쇄 잉크)
         const val LINE_FAINT = 0.95     // 상자 테두리·밑줄처럼 긴 선은 옅어도 살림
         const val INK_NEAR = 0.006      // 글자 근처로 보는 거리(페이지 폭 비율)
         const val CHROMA_KEEP = 14.0    // 이보다 색이 진하면(색 상자·그림) 살림
         const val BLACK_INK_PCT = 50.0  // 글자 픽셀 밝기의 이 백분위를 완전한 검정으로
         const val BLACK_OUT = 12.0      // 검정이 놓일 값 (0으로 몰면 글자 가장자리가 뭉개짐)
-        const val TONE_GAMMA = 1.3      // S자 곡선 뒤 감마. 1보다 크면 글자가 더 진하고 굵게
+        const val TONE_GAMMA = 1.5      // 1보다 크면 글자가 더 진하고 굵게
+        const val S_MIX = 0.6           // S자 곡선 섞는 비율(0~1): 클수록 글자 둘레 얼룩이 깨끗해지지만 옅은 인쇄도 옅어짐
+        const val FLAT_PREBLUR = 1.5    // 조명 평탄화: 배경 추정 전 흐림(긴 변 1000px 기준)
         const val SHARPEN = 0.3         // 언샤프 마스크 세기 (너무 세면 글자가 얼룩덜룩해짐)
         const val SHARPEN_SIGMA = 1.0
-        const val BW_T = 200.0          // 흑백 모드: 톤 보정 후 이보다 어두우면 검정
+        const val BW_T = 140.0          // 흑백 모드: 톤 보정 후 이보다 어두우면 검정
         const val BW_UPSCALE_BELOW = 1600 // 흑백 모드: 페이지 폭이 이보다 작으면 2배로 키워서 자름
         const val ERASE_LIGHT = 200.0   // 손가락 주변 띠에서 이보다 밝은 것(남은 옅은 그림자)만 흰색으로
 

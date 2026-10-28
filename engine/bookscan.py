@@ -646,11 +646,17 @@ def fill_paper(img, mask):
 
 
 # ====================================================================== 4. 화질 보정
+FLAT_PREBLUR = 1.5  # 배경 추정 전 흐림(긴 변 1000px 기준)
+
+
 def flatten_illumination(img):
     """종이 배경(조명·그림자)을 추정해 나눠서 배경을 균일한 흰색으로 만든다."""
     h, w = img.shape[:2]
     s = 1000.0 / max(h, w)
     small = cv2.resize(img, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+    # 종이 결·잡티의 밝은 점이 배경을 실제보다 밝게 끌어올리지 않도록 살짝 흐린 뒤 배경을 잰다
+    # (안 그러면 그림자 진 곳·어두운 곳의 종이가 회색으로 남아 뒷면 비침과 구분이 안 됨)
+    small = cv2.GaussianBlur(small, (0, 0), FLAT_PREBLUR)
     k = max(15, int(max(small.shape[:2]) * 0.035)) | 1
     se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
     bg = cv2.morphologyEx(small, cv2.MORPH_CLOSE, se)  # 글자(어두운 것) 제거
@@ -662,18 +668,19 @@ def flatten_illumination(img):
 
 
 PAPER_PCT = 60        # 종이 밝기 = 조명 평탄화 후 밝기의 이 백분위
-WHITE_TEXT = 0.93     # 글자 근처의 흰색 기준(종이 밝기 대비): 글자 가장자리의 부드러운 회색을 살림
-WHITE_BG = 0.83       # 글자에서 떨어진 곳의 흰색 기준: 뒷면 비침·종이 결을 지움
+WHITE_TEXT = 0.95     # 글자 근처의 흰색 기준(종이 밝기 대비): 글자 가장자리의 부드러운 회색을 살림
+WHITE_BG = 0.86       # 글자에서 떨어진 곳의 흰색 기준: 뒷면 비침·종이 결을 지움
 INK_DARK = 0.62       # 종이 밝기의 이 배보다 어두우면 확실한 글자(인쇄 잉크)
 LINE_FAINT = 0.95     # 상자 테두리·밑줄처럼 긴 선은 옅어도 살림
 INK_NEAR = 0.006      # 글자 근처로 보는 거리(페이지 폭 비율)
 CHROMA_KEEP = 14.0    # 이보다 색이 진하면(색 상자·그림) 살림
 BLACK_INK_PCT = 50.0  # 글자 픽셀 밝기의 이 백분위를 완전한 검정으로
 BLACK_OUT = 12.0      # 검정이 놓일 값 (0으로 몰면 글자 가장자리가 뭉개짐)
-TONE_GAMMA = 1.3      # S자 곡선 뒤 감마. 1보다 크면 글자가 더 진하고 굵게
+TONE_GAMMA = 1.5      # 1보다 크면 글자가 더 진하고 굵게
+S_MIX = 0.6           # S자 곡선 섞는 비율(0~1): 클수록 글자 둘레 얼룩이 깨끗해지지만 옅은 인쇄도 옅어짐
 SHARPEN = 0.3         # 언샤프 마스크 세기 (너무 세면 글자가 얼룩덜룩해짐)
 SHARPEN_SIGMA = 1.0
-BW_T = 200            # 흑백 모드: 톤 보정 후 이보다 어두우면 검정
+BW_T = 140            # 흑백 모드: 톤 보정 후 이보다 어두우면 검정
 BW_UPSCALE_BELOW = 1600  # 흑백 모드: 페이지 폭이 이보다 작으면 2배로 키워서 자름
 
 
@@ -711,8 +718,12 @@ def tone_map(norm):
     near = cv2.GaussianBlur(keep.astype(np.float32), (0, 0), max(1.0, r / 2.0))
     white = paper * (WHITE_BG + (WHITE_TEXT - WHITE_BG) * near)
     t = np.clip((g - black) / np.maximum(white - black, 1.0), 0, 1)
-    # S자 곡선(부드러운 계단) 뒤 감마: 글자 심은 진하게, 글자 둘레의 옅은 얼룩·비침은 흰색 쪽으로
-    y = BLACK_OUT + (255.0 - BLACK_OUT) * (t * t * (3.0 - 2.0 * t)) ** TONE_GAMMA
+    # 곡선: 감마(글자 진하게)와 S자 곡선(글자 둘레의 옅은 얼룩·비침을 흰색 쪽으로)을 섞는다.
+    # 상자 테두리·밑줄 같은 옅은 긴 선 위에서는 S자를 쓰지 않는다(옅은 선이 사라지지 않게).
+    lw = cv2.GaussianBlur(cv2.dilate(lines, np.ones((3, 3), np.uint8)).astype(np.float32), (0, 0), 1.0)
+    sm = S_MIX * (1.0 - lw)
+    u = (1.0 - sm) * t + sm * (t * t * (3.0 - 2.0 * t))
+    y = BLACK_OUT + (255.0 - BLACK_OUT) * u ** TONE_GAMMA
     if color:
         out = norm * (y / np.maximum(g, 1.0))[..., None]
         out[t >= 1] = 255.0
