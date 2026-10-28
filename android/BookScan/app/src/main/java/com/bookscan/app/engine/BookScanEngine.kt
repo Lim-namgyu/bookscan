@@ -551,6 +551,61 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
     // ================================================================= 3. 손가락 제거
 
     /** 종이보다 붉은(피부색) 두꺼운 덩어리 중 페이지 가장자리에서 들어온 것 → 손가락 마스크(원본 크기, 8UC1) */
+    /**
+     * bookscan._finger_bulge: 변에 닿은 피부색 덩어리(0/255, sh x sw)에서 안쪽으로 볼록 튀어나온 손가락 부분 또는 null.
+     * side: 0=왼쪽 1=오른쪽 2=위 3=아래.
+     * 변을 따라 행(또는 열)마다 '변에서 얼마나 깊이 들어왔나'를 재고, 가장 깊은 곳의 절반 이상 들어온 구간(손가락 몸통)이
+     * 짧고 깊으면 손가락. 몸통 구간 앞뒤로 조금 넓혀(손가락 끝 둥근 부분) 그 부분만 돌려준다.
+     */
+    private fun fingerBulge(c: ByteArray, sh: Int, sw: Int, side: Int): ByteArray? {
+        val vertical = side <= 1 // 왼쪽·오른쪽 변: 행을 따라감
+        val nAlong = if (vertical) sh else sw
+        val nDepth = if (vertical) sw else sh
+        fun at(a: Int, d: Int): Boolean { // a: 변을 따라 위치, d: 변에서 깊이(0 = 변)
+            val (yy, xx) = when (side) {
+                0 -> Pair(a, d)
+                1 -> Pair(a, sw - 1 - d)
+                2 -> Pair(d, a)
+                else -> Pair(sh - 1 - d, a)
+            }
+            return c[yy * sw + xx].toInt() != 0
+        }
+        val depth = IntArray(nAlong)
+        var dmax = 0
+        for (a in 0 until nAlong) {
+            for (d in nDepth - 1 downTo 0) if (at(a, d)) {
+                depth[a] = d + 1; break
+            }
+            dmax = max(dmax, depth[a])
+        }
+        if (dmax == 0 || dmax < FINGER_MIN_DEPTH * nDepth) return null
+        var best = 0
+        var cur = 0
+        var b0 = 0
+        var c0 = 0
+        for (a in 0 until nAlong) {
+            if (depth[a] >= 0.5 * dmax) {
+                if (cur == 0) c0 = a
+                cur++
+                if (cur > best) {
+                    best = cur; b0 = c0
+                }
+            } else {
+                cur = 0
+            }
+        }
+        if (best > FINGER_MAX_ALONG * nAlong || best > FINGER_ALONG_DEPTH * dmax) return null
+        val pad = (0.6 * dmax).toInt()
+        val r0 = max(0, b0 - pad)
+        val r1 = min(nAlong, b0 + best + pad)
+        val out = ByteArray(sh * sw)
+        for (y in 0 until sh) for (x in 0 until sw) {
+            val a = if (vertical) y else x
+            if (a in r0 until r1 && c[y * sw + x].toInt() != 0) out[y * sw + x] = 255.toByte()
+        }
+        return out
+    }
+
     private fun fingerMask(img: Mat, skipSide: Side?): Mat {
         val h = img.rows()
         val w = img.cols()
@@ -615,23 +670,26 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
             val bh = stats.get(i, Imgproc.CC_STAT_HEIGHT)[0].toInt()
             val area = stats.get(i, Imgproc.CC_STAT_AREA)[0]
             if (area < sh * sw * 0.0006) continue
-            // 가장자리에 닿아야 하고(손가락은 바깥에서 들어옴), 한 변을 따라 길게 이어진 띠(책 옆면)는 제외
-            // (변을 따라 길이 비율, 안쪽 깊이 비율, 변을 따라 길이 px, 깊이 px)
-            val sides = ArrayList<DoubleArray>()
-            if (x <= edge && skipSide != Side.LEFT) sides.add(doubleArrayOf(bh.toDouble() / sh, bw.toDouble() / sw, bh.toDouble(), bw.toDouble()))
-            if (x + bw >= sw - edge && skipSide != Side.RIGHT) sides.add(doubleArrayOf(bh.toDouble() / sh, bw.toDouble() / sw, bh.toDouble(), bw.toDouble()))
-            if (y <= edge) sides.add(doubleArrayOf(bw.toDouble() / sw, bh.toDouble() / sh, bw.toDouble(), bh.toDouble()))
-            if (y + bh >= sh - edge) sides.add(doubleArrayOf(bw.toDouble() / sw, bh.toDouble() / sh, bw.toDouble(), bh.toDouble()))
-            if (sides.isEmpty()) continue
-            if (sides.any { it[0] > 0.40 }) continue
-            if (sides.maxOf { it[1] } < 0.02) continue
-            // 손가락은 안쪽으로 파고든다. 가장자리를 따라 가늘고 길게 붙은 띠(책 옆면·바랜 가장자리)는 제외
-            if (sides.all { it[2] > 2.0 * it[3] }) continue
             // 심지를 원래 두께만큼 되살리되 피부색 영역 안에서만
             Core.compare(labels, Scalar(i.toDouble()), comp, Core.CMP_EQ)
             Imgproc.dilate(comp, comp, kern)
             Core.bitwise_and(comp, skin, comp)
-            Core.bitwise_or(mask, comp, mask)
+            // 가장자리에 닿아 있어야 하고(손가락은 바깥에서 들어온다), 안쪽으로 볼록 튀어나온 부분만 손가락.
+            // 손가락이 책 옆면 띠(변을 따라 길고 얕은 피부색 띠)와 붙어 있으면 띠 부분은 떼어낸다.
+            var cb: ByteArray? = null
+            val touches = listOf(
+                Side.LEFT to (x <= edge), Side.RIGHT to (x + bw >= sw - edge),
+                null to (y <= edge), null to (y + bh >= sh - edge)
+            )
+            for ((idx, t) in touches.withIndex()) {
+                val (side, touch) = t
+                if (!touch || (side != null && side == skipSide)) continue
+                if (cb == null) cb = ByteArray(n).also { comp.get(0, 0, it) }
+                val part = fingerBulge(cb, sh, sw, idx) ?: continue
+                val pm = Mat(sh, sw, CvType.CV_8UC1).also { it.put(0, 0, part) }
+                Core.bitwise_or(mask, pm, mask)
+                pm.release()
+            }
         }
         comp.release(); labels.release(); stats.release(); cents.release(); core.release(); skin.release()
 
@@ -852,7 +910,13 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         val white8 = Mat()
         white.convertTo(white8, CvType.CV_8U)
         white.release()
-        // y = BLACK_OUT + (255 - BLACK_OUT) * t^gamma
+        // y = BLACK_OUT + (255 - BLACK_OUT) * (t²(3 - 2t))^gamma
+        // S자 곡선(부드러운 계단) 뒤 감마: 글자 심은 진하게, 글자 둘레의 옅은 얼룩·비침은 흰색 쪽으로
+        val u = Mat()
+        t.convertTo(u, CvType.CV_32F, -2.0, 3.0)
+        Core.multiply(u, t, u)
+        Core.multiply(u, t, t)
+        u.release()
         Core.pow(t, TONE_GAMMA, t)
         t.convertTo(t, CvType.CV_32F, 255.0 - BLACK_OUT, BLACK_OUT)
         val out = Mat()
@@ -922,9 +986,9 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
     /**
      * 가장자리 띠(각 변의 4%, 접힌 선 쪽은 6%) 안의 선 찌꺼기(페이지 경계선, 접힌 선 그림자, 책 옆면 줄무늬)를 흰색으로.
      *  - 긴 세로선·가로선: 글자는 짧은 획들이라 긴 선 모양 걸러내기(열림 연산)를 통과하지 못한다.
-     *  - 띠 안에 완전히 들어 있는 가늘고 긴 조각(변과 나란한 방향으로 2.5배 이상 김)
-     *  - 변에 붙은 잔무늬 덩어리(바닥 카펫·책 옆면 찌꺼기): 어두운 점이 빽빽한 곳이 변에 닿아 있고 안쪽으로 얕게(8% 이내)만 들어온 것.
-     *    본문 글은 여백 때문에 변에 닿지 않는다.
+     *  - 띠 안에 완전히 들어 있는 가늘고 긴 조각(좌우: 세로로 2.5배 이상, 위아래: 가로로 8배 이상·폭 5% 이상)
+     *  - 좌우 변에 붙은 세로 잔무늬 띠(바닥 카펫·책 옆면 찌꺼기): 어두운 점이 빽빽한 곳이 변에 닿아 있고
+     *    안쪽으로 얕게(8% 이내)만 들어왔으며 세로로 긴 것. 글줄(가로로 긴 덩어리)은 건드리지 않는다.
      * out 을 직접 수정. gutterSide: 접힌 선 쪽
      */
     private fun cleanEdges(out: Mat, gutterSide: Side?) {
@@ -980,7 +1044,8 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
                 val bw = stats[i * 5 + 2]
                 val bh = stats[i * 5 + 3]
                 val sideLr = (x + bw <= bl || x >= sw - br) && bh >= 2.5 * bw && bh >= sh * 0.01
-                val sideTb = (y + bh <= by || y >= sh - by) && bw >= 2.5 * bh && bw >= sw * 0.01
+                // 위아래는 아주 긴 가로 조각(페이지 경계선)만: 글자 획 하나(예: '그'의 'ㅡ')를 지우지 않게
+                val sideTb = (y + bh <= by || y >= sh - by) && bw >= 8 * bh && bw >= sw * 0.05
                 hit[i] = sideLr || sideTb
             }
             for (k in 0 until sh * sw) if (hit[labels[k]]) {
@@ -1010,17 +1075,14 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
             val labels = IntArray(sh * sw).also { lbl.get(0, 0, it) }
             lbl.release(); st.release()
             val tx = sw * 0.01
-            val ty = sh * 0.01
             val dx = sw * EDGE_TEXTURE
-            val dy = sh * EDGE_TEXTURE
             val hit = BooleanArray(n)
             for (i in 1 until n) {
                 val x = stats[i * 5]
-                val y = stats[i * 5 + 1]
                 val bw = stats[i * 5 + 2]
                 val bh = stats[i * 5 + 3]
-                hit[i] = (x <= tx && x + bw <= dx) || (x + bw >= sw - tx && x >= sw - dx) ||
-                    (y <= ty && y + bh <= dy) || (y + bh >= sh - ty && y >= sh - dy)
+                // 좌우 변에 붙어 있고, 안쪽으로 얕고, 세로로 긴 것만 (글줄은 가로로 길어 해당 없음)
+                hit[i] = ((x <= tx && x + bw <= dx) || (x + bw >= sw - tx && x >= sw - dx)) && bh >= 3 * bw
             }
             for (k in 0 until sh * sw) if (hit[labels[k]]) {
                 mb[k] = 255.toByte(); any = true
@@ -1165,17 +1227,23 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         /** 처리 해상도 상한(긴 변). 카메라 원본(4000x3000)을 그대로 써서 양면을 나눠도 글씨가 또렷하게 */
         const val MAX_SIDE = 4000
 
+        // ---- 손가락: 변에서 들어온 깊이 최소(변과 수직 길이 대비), 몸통이 변을 따라 차지하는 길이 최대(변 길이 대비),
+        //      몸통의 (변을 따라 길이)/(깊이) 최대 — 이보다 길쭉하면 책 옆면 띠
+        const val FINGER_MIN_DEPTH = 0.02
+        const val FINGER_MAX_ALONG = 0.40
+        const val FINGER_ALONG_DEPTH = 2.0
+
         // ---- 화질 보정(톤): engine/bookscan.py 의 같은 이름 상수
         const val PAPER_PCT = 60.0      // 종이 밝기 = 조명 평탄화 후 밝기의 이 백분위
-        const val WHITE_TEXT = 0.96     // 글자 근처의 흰색 기준(종이 밝기 대비): 글자 가장자리의 부드러운 회색을 살림
+        const val WHITE_TEXT = 0.93     // 글자 근처의 흰색 기준(종이 밝기 대비): 글자 가장자리의 부드러운 회색을 살림
         const val WHITE_BG = 0.83       // 글자에서 떨어진 곳의 흰색 기준: 뒷면 비침·종이 결을 지움
         const val INK_DARK = 0.62       // 종이 밝기의 이 배보다 어두우면 확실한 글자(인쇄 잉크)
         const val LINE_FAINT = 0.95     // 상자 테두리·밑줄처럼 긴 선은 옅어도 살림
         const val INK_NEAR = 0.006      // 글자 근처로 보는 거리(페이지 폭 비율)
         const val CHROMA_KEEP = 14.0    // 이보다 색이 진하면(색 상자·그림) 살림
-        const val BLACK_INK_PCT = 25.0  // 글자 픽셀 밝기의 이 백분위를 완전한 검정으로
+        const val BLACK_INK_PCT = 50.0  // 글자 픽셀 밝기의 이 백분위를 완전한 검정으로
         const val BLACK_OUT = 12.0      // 검정이 놓일 값 (0으로 몰면 글자 가장자리가 뭉개짐)
-        const val TONE_GAMMA = 1.25     // 1보다 크면 중간 밝기(옅은 글씨·글자 가장자리)를 조금 진하게
+        const val TONE_GAMMA = 1.3      // S자 곡선 뒤 감마. 1보다 크면 글자가 더 진하고 굵게
         const val SHARPEN = 0.3         // 언샤프 마스크 세기 (너무 세면 글자가 얼룩덜룩해짐)
         const val SHARPEN_SIGMA = 1.0
         const val BW_T = 200.0          // 흑백 모드: 톤 보정 후 이보다 어두우면 검정

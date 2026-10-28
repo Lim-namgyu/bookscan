@@ -505,6 +505,53 @@ def trim_dark_border(img, max_frac=0.06):
 
 
 # ====================================================================== 3. 손가락 제거
+FINGER_MIN_DEPTH = 0.02   # 손가락이 변에서 안쪽으로 들어온 깊이(변과 수직인 길이 대비) 최소
+FINGER_MAX_ALONG = 0.40   # 손가락 몸통이 변을 따라 차지하는 길이 최대(변 길이 대비)
+FINGER_ALONG_DEPTH = 2.0  # 손가락 몸통의 (변을 따라 길이) / (깊이) 최대 — 이보다 길쭉하면 책 옆면 띠
+
+
+def _finger_bulge(comp, side):
+    """
+    변에 닿은 피부색 덩어리에서 안쪽으로 볼록 튀어나온 손가락 부분(bool 마스크) 또는 None.
+    변을 따라 행(또는 열)마다 '변에서 얼마나 깊이 들어왔나'를 재고, 가장 깊은 곳의 절반 이상 들어온
+    구간(손가락 몸통)이 짧고 깊으면 손가락. 몸통 구간 앞뒤로 조금 넓혀(손가락 끝 둥근 부분) 그 부분만 돌려준다.
+    """
+    sh, sw = comp.shape
+    c = comp if side in ("left", "right") else comp.T
+    n_along, n_depth = c.shape
+    if side in ("right", "bottom"):
+        c = c[:, ::-1]
+    any_ = c.any(axis=1)
+    if not any_.any():
+        return None
+    # 변(열 0)에서 이어진 부분의 깊이: 행마다 가장 안쪽 픽셀 + 1
+    depth = np.where(any_, n_depth - np.argmax(c[:, ::-1], axis=1), 0)
+    dmax = int(depth.max())
+    if dmax < FINGER_MIN_DEPTH * n_depth:
+        return None
+    core = depth >= 0.5 * dmax
+    # 가장 긴 연속 구간
+    best, cur, b0, c0 = 0, 0, 0, 0
+    for i, v in enumerate(core):
+        if v:
+            if cur == 0:
+                c0 = i
+            cur += 1
+            if cur > best:
+                best, b0 = cur, c0
+        else:
+            cur = 0
+    if best > FINGER_MAX_ALONG * n_along or best > FINGER_ALONG_DEPTH * dmax:
+        return None
+    pad = int(0.6 * dmax)
+    r0, r1 = max(0, b0 - pad), min(n_along, b0 + best + pad)
+    out = np.zeros_like(c)
+    out[r0:r1] = c[r0:r1]
+    if side in ("right", "bottom"):
+        out = out[:, ::-1]
+    return out if side in ("left", "right") else out.T
+
+
 def finger_mask(img, skip_side=None):
     """종이보다 붉은(피부색) 두꺼운 덩어리 중 페이지 가장자리에 닿은 것을 손가락으로 본다.
     skip_side: 'left' / 'right' — 양면에서 접힌 선 쪽(손가락이 오지 않는 쪽)은 검사 제외"""
@@ -541,28 +588,21 @@ def finger_mask(img, skip_side=None):
             continue
         # 심지를 원래 두께만큼 되살리되 피부색 영역 안에서만
         comp = cv2.dilate((lbl == i).astype(np.uint8), kern).astype(bool) & (skin > 0)
-        # 가장자리에 닿아 있어야 하고(손가락은 바깥에서 들어온다),
-        # 한 변을 따라 길게 이어진 띠(책 옆면, 누렇게 변한 가장자리)는 제외
-        # (변을 따라 길이 비율, 안쪽 깊이 비율, 변을 따라 길이 px, 깊이 px)
-        sides = []
-        if x <= edge and skip_side != "left":
-            sides.append((bh / sh, bw / sw, bh, bw))
-        if x + bw >= sw - edge and skip_side != "right":
-            sides.append((bh / sh, bw / sw, bh, bw))
-        if y <= edge:
-            sides.append((bw / sw, bh / sh, bw, bh))
-        if y + bh >= sh - edge:
-            sides.append((bw / sw, bh / sh, bw, bh))
-        if not sides:
-            continue
-        if any(s_[0] > 0.40 for s_ in sides):
-            continue
-        if max(s_[1] for s_ in sides) < 0.02:
-            continue
-        # 손가락은 안쪽으로 파고든다. 가장자리를 따라 가늘고 길게 붙은 띠(책 옆면·바랜 가장자리)는 제외
-        if all(s_[2] > 2.0 * s_[3] for s_ in sides):
-            continue
-        mask[comp] = 255
+        # 가장자리에 닿아 있어야 하고(손가락은 바깥에서 들어온다), 안쪽으로 볼록 튀어나온 부분만 손가락.
+        # 손가락이 책 옆면 띠(변을 따라 길고 얕은 피부색 띠)와 붙어 있으면 띠 부분은 떼어낸다.
+        part = np.zeros_like(comp)
+        for side in ("left", "right", "top", "bottom"):
+            if side == skip_side:
+                continue
+            touch = {"left": x <= edge, "right": x + bw >= sw - edge,
+                     "top": y <= edge, "bottom": y + bh >= sh - edge}[side]
+            if not touch:
+                continue
+            got = _finger_bulge(comp, side)
+            if got is not None:
+                part |= got
+        if part.any():
+            mask[part] = 255
 
     if mask.any():
         # 손가락 가장자리(어두운 테두리)와 맞닿은 그림자까지 덮도록 확장
@@ -622,15 +662,15 @@ def flatten_illumination(img):
 
 
 PAPER_PCT = 60        # 종이 밝기 = 조명 평탄화 후 밝기의 이 백분위
-WHITE_TEXT = 0.96     # 글자 근처의 흰색 기준(종이 밝기 대비): 글자 가장자리의 부드러운 회색을 살림
+WHITE_TEXT = 0.93     # 글자 근처의 흰색 기준(종이 밝기 대비): 글자 가장자리의 부드러운 회색을 살림
 WHITE_BG = 0.83       # 글자에서 떨어진 곳의 흰색 기준: 뒷면 비침·종이 결을 지움
 INK_DARK = 0.62       # 종이 밝기의 이 배보다 어두우면 확실한 글자(인쇄 잉크)
 LINE_FAINT = 0.95     # 상자 테두리·밑줄처럼 긴 선은 옅어도 살림
 INK_NEAR = 0.006      # 글자 근처로 보는 거리(페이지 폭 비율)
 CHROMA_KEEP = 14.0    # 이보다 색이 진하면(색 상자·그림) 살림
-BLACK_INK_PCT = 25.0  # 글자 픽셀 밝기의 이 백분위를 완전한 검정으로
+BLACK_INK_PCT = 50.0  # 글자 픽셀 밝기의 이 백분위를 완전한 검정으로
 BLACK_OUT = 12.0      # 검정이 놓일 값 (0으로 몰면 글자 가장자리가 뭉개짐)
-TONE_GAMMA = 1.25     # 1보다 크면 중간 밝기(옅은 글씨·글자 가장자리)를 조금 진하게
+TONE_GAMMA = 1.3      # S자 곡선 뒤 감마. 1보다 크면 글자가 더 진하고 굵게
 SHARPEN = 0.3         # 언샤프 마스크 세기 (너무 세면 글자가 얼룩덜룩해짐)
 SHARPEN_SIGMA = 1.0
 BW_T = 200            # 흑백 모드: 톤 보정 후 이보다 어두우면 검정
@@ -671,7 +711,8 @@ def tone_map(norm):
     near = cv2.GaussianBlur(keep.astype(np.float32), (0, 0), max(1.0, r / 2.0))
     white = paper * (WHITE_BG + (WHITE_TEXT - WHITE_BG) * near)
     t = np.clip((g - black) / np.maximum(white - black, 1.0), 0, 1)
-    y = BLACK_OUT + (255.0 - BLACK_OUT) * t ** TONE_GAMMA
+    # S자 곡선(부드러운 계단) 뒤 감마: 글자 심은 진하게, 글자 둘레의 옅은 얼룩·비침은 흰색 쪽으로
+    y = BLACK_OUT + (255.0 - BLACK_OUT) * (t * t * (3.0 - 2.0 * t)) ** TONE_GAMMA
     if color:
         out = norm * (y / np.maximum(g, 1.0))[..., None]
         out[t >= 1] = 255.0
@@ -729,26 +770,26 @@ def clean_edges(out, gutter_side=None):
     m[:, sw - br:] |= vert[:, sw - br:]
     m[:by, :] |= horz[:by, :]
     m[sh - by:, :] |= horz[sh - by:, :]
-    # 띠 안의 가늘고 긴 조각
+    # 띠 안의 가늘고 긴 조각: 좌우 띠는 세로로 긴 조각(책 옆면 줄), 위아래 띠는 아주 긴 가로 조각(페이지 경계선)만.
+    # (글자 획 하나 — 예: '그'의 'ㅡ' — 를 지우지 않도록 위아래는 엄격하게)
     n, lbl, st, _ = cv2.connectedComponentsWithStats(dark, 8)
     for i in range(1, n):
         x, y, bw, bh, _ = st[i]
         side_lr = (x + bw <= bl or x >= sw - br) and bh >= 2.5 * bw and bh >= sh * 0.01
-        side_tb = (y + bh <= by or y >= sh - by) and bw >= 2.5 * bh and bw >= sw * 0.01
+        side_tb = (y + bh <= by or y >= sh - by) and bw >= 8 * bh and bw >= sw * 0.05
         if side_lr or side_tb:
             m[y:y + bh, x:x + bw][lbl[y:y + bh, x:x + bw] == i] = 255
-    # 변에 붙은 잔무늬 덩어리(바닥 카펫·책 옆면 찌꺼기): 어두운 점이 빽빽한 곳이 변에 닿아 있고
-    # 변에서 안쪽으로 얕게(8% 이내)만 들어온 것. 본문 글은 여백 때문에 변에 닿지 않는다.
+    # 좌우 변에 붙은 세로 잔무늬 띠(바닥 카펫·책 옆면 찌꺼기): 어두운 점이 빽빽한 곳이 변에 닿아 있고
+    # 안쪽으로 얕게(8% 이내)만 들어왔으며 세로로 긴 것. 글줄(가로로 긴 덩어리)은 건드리지 않는다.
     k = max(5, int(min(sh, sw) * 0.015)) | 1
     dens = cv2.boxFilter((dark > 0).astype(np.float32), -1, (k, k))
     tex = (dens > 0.10).astype(np.uint8)
     n, lbl, st, _ = cv2.connectedComponentsWithStats(tex, 8)
-    tx, ty = sw * 0.01, sh * 0.01
-    dx, dy = sw * EDGE_TEXTURE, sh * EDGE_TEXTURE
+    tx = sw * 0.01
+    dx = sw * EDGE_TEXTURE
     for i in range(1, n):
         x, y, bw, bh, _ = st[i]
-        hit = (x <= tx and x + bw <= dx) or (x + bw >= sw - tx and x >= sw - dx) or \
-              (y <= ty and y + bh <= dy) or (y + bh >= sh - ty and y >= sh - dy)
+        hit = ((x <= tx and x + bw <= dx) or (x + bw >= sw - tx and x >= sw - dx)) and bh >= 3 * bw
         if hit:
             m[y:y + bh, x:x + bw][lbl[y:y + bh, x:x + bw] == i] = 255
     if not m.any():
