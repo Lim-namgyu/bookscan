@@ -1,9 +1,14 @@
 package com.bookscan.app.ui
 
 import android.Manifest
+import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Matrix
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.media.MediaActionSound
 import android.view.OrientationEventListener
 import android.view.Surface
@@ -22,6 +27,7 @@ import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -63,7 +69,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -75,11 +85,15 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.bookscan.app.MainViewModel
-import com.bookscan.app.camera.PageTurnDetector
+import com.bookscan.app.camera.CaptureReadiness
+import com.bookscan.app.engine.BookRegion
 import com.bookscan.app.engine.ColorMode
 import com.bookscan.app.engine.Layout
 import kotlinx.coroutines.delay
+import org.opencv.android.OpenCVLoader
 import java.util.concurrent.Executors
+import kotlin.math.atan2
+import kotlin.math.sqrt
 
 @Composable
 fun CameraScreen(vm: MainViewModel, onOpenReview: () -> Unit) {
@@ -128,7 +142,13 @@ private fun CameraContent(vm: MainViewModel, onOpenReview: () -> Unit) {
             )
             .build()
     }
-    val detector = remember { PageTurnDetector() }
+    val readiness = remember {
+        CaptureReadiness {
+            // 책 영역 모델(2.3MB)을 프리뷰 분석 스레드에서 올린다. 실패하면 책 위치 안내 없이 나머지만 판단
+            if (!OpenCVLoader.initLocal()) null
+            else BookRegion(ctx.assets.open("u2netp.onnx").use { it.readBytes() })
+        }
+    }
     val captureExecutor = remember { Executors.newSingleThreadExecutor() }
     val sound = remember { MediaActionSound().apply { load(MediaActionSound.SHUTTER_CLICK) } }
 
@@ -136,7 +156,7 @@ private fun CameraContent(vm: MainViewModel, onOpenReview: () -> Unit) {
     var torchOn by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
     var flash by remember { mutableStateOf(false) }
-    var detState by remember { mutableStateOf(PageTurnDetector.State.WAITING) }
+    var status by remember { mutableStateOf<CaptureReadiness.Status?>(null) }
 
     val capture: () -> Unit = {
         if (!busy) {
@@ -157,7 +177,7 @@ private fun CameraContent(vm: MainViewModel, onOpenReview: () -> Unit) {
                         }
                         val upright = Bitmap.createBitmap(raw, 0, 0, raw.width, raw.height, m, true)
                         if (upright !== raw) raw.recycle()
-                        detector.markCaptured()
+                        readiness.markCaptured()
                         mainExecutor.execute {
                             busy = false
                             vm.onPhoto(upright)
@@ -181,13 +201,32 @@ private fun CameraContent(vm: MainViewModel, onOpenReview: () -> Unit) {
         }
     }
 
-    // 자동 촬영 연결
+    // 촬영 준비 상태 · 자동 촬영 연결
     SideEffect {
-        detector.onTrigger = { mainExecutor.execute { capture() } }
-        detector.onState = { st -> mainExecutor.execute { detState = st } }
+        readiness.onTrigger = { mainExecutor.execute { capture() } }
+        readiness.onStatus = { st -> mainExecutor.execute { status = st } }
     }
-    LaunchedEffect(vm.autoCapture) { detector.enabled = vm.autoCapture }
+    LaunchedEffect(vm.autoCapture) { readiness.autoEnabled = vm.autoCapture }
     LaunchedEffect(torchOn, camera) { camera?.cameraControl?.enableTorch(torchOn) }
+
+    // 폰 기울기(책과 나란한지): 중력 방향과 화면 수직축 사이 각도
+    DisposableEffect(Unit) {
+        val sm = ctx.getSystemService(Context.SENSOR_SERVICE) as SensorManager
+        val sensor = sm.getDefaultSensor(Sensor.TYPE_GRAVITY) ?: sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        val listener = object : SensorEventListener {
+            var fx = 0f; var fy = 0f; var fz = 9.8f
+            override fun onSensorChanged(e: SensorEvent) {
+                fx = fx * 0.8f + e.values[0] * 0.2f
+                fy = fy * 0.8f + e.values[1] * 0.2f
+                fz = fz * 0.8f + e.values[2] * 0.2f
+                val tilt = Math.toDegrees(atan2(sqrt(fx * fx + fy * fy).toDouble(), Math.abs(fz).toDouble())).toFloat()
+                readiness.tiltDeg = tilt
+            }
+            override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+        }
+        if (sensor != null) sm.registerListener(listener, sensor, SensorManager.SENSOR_DELAY_UI)
+        onDispose { sm.unregisterListener(listener) }
+    }
 
     // 화면은 세로로 고정이지만, 폰을 가로로 들고 찍으면 사진도 가로로 저장되게(양면 촬영 시 흔함)
     DisposableEffect(Unit) {
@@ -236,8 +275,9 @@ private fun CameraContent(vm: MainViewModel, onOpenReview: () -> Unit) {
             val analysis = ImageAnalysis.Builder()
                 .setResolutionSelector(ratio)
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                 .build()
-            analysis.setAnalyzer(analysisExecutor, detector)
+            analysis.setAnalyzer(analysisExecutor, readiness)
             try {
                 provider.unbindAll()
                 camera = provider.bindToLifecycle(
@@ -250,6 +290,7 @@ private fun CameraContent(vm: MainViewModel, onOpenReview: () -> Unit) {
         onDispose {
             // 카메라를 먼저 해제한 뒤 실행기를 닫아야, 진행 중이던 촬영 콜백이 닫힌 실행기로 가지 않는다
             runCatching { future.get().unbindAll() }
+            analysisExecutor.execute { readiness.close() }
             analysisExecutor.shutdown()
             captureExecutor.shutdown()
             sound.release()
@@ -268,6 +309,32 @@ private fun CameraContent(vm: MainViewModel, onOpenReview: () -> Unit) {
                 }
             }
         )
+
+        // 책 영역 테두리: 준비되면 초록, 아니면 흰색
+        val st = status
+        val ready = st?.ready == true
+        val readyColor = Color(0xFF4CD964)
+        if (st?.box != null) {
+            val box = st.box
+            Canvas(Modifier.fillMaxSize()) {
+                // 프리뷰(FIT_CENTER, 세로 화면에서 3:4)가 실제로 그려진 영역
+                val aspect = 3f / 4f
+                val cw = minOf(size.width, size.height * aspect)
+                val ch = cw / aspect
+                val ox = (size.width - cw) / 2f
+                val oy = (size.height - ch) / 2f
+                val l = ox + box.left * cw
+                val t = oy + box.top * ch
+                val r = ox + box.right * cw
+                val b = oy + box.bottom * ch
+                drawRoundRect(
+                    color = if (ready) readyColor else Color.White.copy(alpha = 0.8f),
+                    topLeft = Offset(l, t), size = Size(r - l, b - t),
+                    cornerRadius = CornerRadius(16f, 16f),
+                    style = Stroke(width = if (ready) 6f else 3f),
+                )
+            }
+        }
 
         if (flash) Box(Modifier.fillMaxSize().background(Color.White.copy(alpha = 0.35f)))
 
@@ -292,13 +359,34 @@ private fun CameraContent(vm: MainViewModel, onOpenReview: () -> Unit) {
                 Spacer(Modifier.width(8.dp))
                 OptionChip("손가락 제거", vm.removeFingers) { vm.removeFingers = !vm.removeFingers }
             }
-            if (vm.autoCapture) {
-                val msg = when (detState) {
-                    PageTurnDetector.State.WAITING -> "페이지를 넘기면 자동으로 찍어요"
-                    PageTurnDetector.State.MOVING -> "넘기는 중…"
-                    PageTurnDetector.State.STEADYING -> "멈추면 찍어요…"
-                }
-                Text(msg, color = MaterialTheme.colorScheme.primary, fontSize = 13.sp, modifier = Modifier.padding(top = 2.dp))
+        }
+
+        // ---- 촬영 준비 상태 안내
+        Box(
+            Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(top = 118.dp, start = 24.dp, end = 24.dp),
+            contentAlignment = Alignment.TopCenter,
+        ) {
+            Row(
+                Modifier.clip(RoundedCornerShape(20.dp))
+                    .background(if (ready) readyColor.copy(alpha = 0.9f) else Color.Black.copy(alpha = 0.6f))
+                    .padding(horizontal = 14.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Box(
+                    Modifier.size(10.dp).clip(CircleShape).background(
+                        when {
+                            ready -> Color.White
+                            st == null || st.issue == CaptureReadiness.Issue.BLURRY || st.issue == CaptureReadiness.Issue.MOVING -> Color(0xFFFFC107)
+                            else -> Color(0xFFFF5252)
+                        }
+                    )
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    statusText(st, vm.autoCapture),
+                    color = if (ready) Color.Black else Color.White,
+                    fontSize = 14.sp, fontWeight = FontWeight.Medium,
+                )
             }
         }
 
@@ -335,11 +423,11 @@ private fun CameraContent(vm: MainViewModel, onOpenReview: () -> Unit) {
                     }
                 }
 
-                // 셔터
+                // 셔터 (준비되면 초록 테두리)
                 Box(
-                    Modifier.size(78.dp).clip(CircleShape).border(4.dp, Color.White, CircleShape)
+                    Modifier.size(78.dp).clip(CircleShape).border(4.dp, if (ready) readyColor else Color.White, CircleShape)
                         .padding(7.dp).clip(CircleShape)
-                        .background(if (busy) Color.Gray else Color.White)
+                        .background(if (busy) Color.Gray else if (ready) readyColor else Color.White)
                         .clickable(enabled = !busy) { capture() }
                 )
 
@@ -361,6 +449,22 @@ private fun CameraContent(vm: MainViewModel, onOpenReview: () -> Unit) {
                 }
             }
         }
+    }
+}
+
+private fun statusText(st: CaptureReadiness.Status?, auto: Boolean): String {
+    if (st == null) return "책을 비춰 주세요"
+    return when (st.issue) {
+        CaptureReadiness.Issue.NO_BOOK -> "책을 비춰 주세요"
+        CaptureReadiness.Issue.TOO_SMALL -> "책이 작아요 — 조금 더 가까이"
+        CaptureReadiness.Issue.CUT_OFF -> "책이 잘렸어요 — 전체가 보이게 조금 멀리"
+        CaptureReadiness.Issue.OFF_CENTER -> "책을 화면 가운데로"
+        CaptureReadiness.Issue.TILTED -> "폰을 책과 나란히(수평으로) 들어 주세요"
+        CaptureReadiness.Issue.DARK -> "어두워요 — 조명을 켜 보세요"
+        CaptureReadiness.Issue.BRIGHT -> "너무 밝아요 — 빛 반사를 피해 주세요"
+        CaptureReadiness.Issue.MOVING -> "잠시 멈춰 주세요"
+        CaptureReadiness.Issue.BLURRY -> if (st.focusStuck) "화면을 탭해서 초점을 맞춰 주세요" else "초점을 맞추는 중…"
+        CaptureReadiness.Issue.NONE -> if (auto) "좋아요 — 자동으로 찍어요" else "스캔하기 좋아요 — 찍으세요"
     }
 }
 

@@ -78,7 +78,12 @@ class BookRegion(modelBytes: ByteArray) : AutoCloseable {
      * 책 영역 마스크(원본 크기 8UC1, 0/255)와 경계 상자. 못 찾으면 null.
      * 가장 큰 덩어리 + 그만큼 큰 덩어리들(접힌 곳이 어두워 양쪽 페이지가 따로 잡히는 경우), 안쪽 구멍은 메움.
      */
+    /** 마지막 mask() 호출이 null 을 돌려준 이유 (촬영 안내에 사용) */
+    @Volatile var lastReason: Int = REASON_OK
+        private set
+
     fun mask(rgb: Mat): Pair<Mat, Rect>? {
+        lastReason = REASON_OK
         val w = rgb.cols()
         val h = rgb.rows()
         val p = saliency(rgb)
@@ -90,14 +95,14 @@ class BookRegion(modelBytes: ByteArray) : AutoCloseable {
         val n = Imgproc.connectedComponentsWithStats(bm, lbl, st, cen, 8, CvType.CV_32S)
         bm.release(); cen.release()
         if (n < 2) {
-            lbl.release(); st.release(); return null
+            lbl.release(); st.release(); lastReason = REASON_NONE; return null
         }
         val stats = IntArray(n * 5).also { st.get(0, 0, it) }
         st.release()
         var big = 0
         for (i in 1 until n) big = max(big, stats[i * 5 + Imgproc.CC_STAT_AREA])
         if (big.toDouble() / (SIZE * SIZE) < 0.08) {
-            lbl.release(); return null
+            lbl.release(); lastReason = REASON_SMALL; return null
         }
         val keep = BooleanArray(n) { it > 0 && stats[it * 5 + Imgproc.CC_STAT_AREA] >= big * 0.2 }
         val labels = IntArray(SIZE * SIZE).also { lbl.get(0, 0, it) }
@@ -117,6 +122,7 @@ class BookRegion(modelBytes: ByteArray) : AutoCloseable {
             // 책 바깥이어야 할 곳이 대부분 종이(밝고 매끈함) → 페이지가 화면을 꽉 채웠거나 표·그림만 잡은 것.
             // 이런 마스크로 자르면 페이지 일부가 잘려 나가므로 쓰지 않는다.
             comp.release()
+            lastReason = REASON_FILLS
             return null
         }
         val m = Mat()
@@ -181,6 +187,11 @@ class BookRegion(modelBytes: ByteArray) : AutoCloseable {
 
     companion object {
         const val SIZE = 320
+
+        const val REASON_OK = 0
+        const val REASON_NONE = 1   // 두드러진 물체가 없음
+        const val REASON_SMALL = 2  // 책이 너무 작게 잡힘(화면의 8% 미만)
+        const val REASON_FILLS = 3  // 종이가 화면 밖까지 이어짐(책이 잘렸거나 화면을 꽉 채움)
 
         /** 마스크 바깥 중 종이처럼 보이는 비율이 이보다 크면 마스크를 믿지 않음 */
         const val PAPER_OUTSIDE_MAX = 0.15
