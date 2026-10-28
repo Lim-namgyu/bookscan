@@ -698,6 +698,8 @@ WHITE_TEXT = 0.95     # 글자 근처의 흰색 기준(종이 밝기 대비): �
 WHITE_BG = 0.86       # 글자에서 떨어진 곳의 흰색 기준: 뒷면 비침·종이 결을 지움
 INK_DARK = 0.62       # 종이 밝기의 이 배보다 어두우면 확실한 글자(인쇄 잉크)
 LINE_FAINT = 0.95     # 상자 테두리·밑줄처럼 긴 선은 옅어도 살림
+LINE_DARK = 0.80      # 긴 선 조각 중 이 비율보다 어두운 픽셀이
+LINE_DARK_FRAC = 0.25 # 이만큼은 있어야 인쇄된 선(접힌 자국·그림자 경계는 더 옅고 고름)
 INK_NEAR = 0.006      # 글자 근처로 보는 거리(페이지 폭 비율)
 CHROMA_KEEP = 8.0     # 종이 색을 뺀 채도가 이보다 진하면(색 상자·그림·색 글씨) 살림
 COLOR_SAT = 1.3       # 색을 이만큼 진하게(1 = 그대로)
@@ -735,6 +737,15 @@ def tone_map(norm):
     L = max(9, int(w * 0.03))
     lines = cv2.morphologyEx(faint, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (L, 1))) | \
         cv2.morphologyEx(faint, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, L)))
+    # 종이 접힌 자국·그림자 경계도 긴 '옅은 선'으로 잡히므로, 선 조각마다 충분히 진한 픽셀이 있어야 인쇄된 선으로 본다
+    nl, ll, _, _ = cv2.connectedComponentsWithStats(lines, 8)
+    if nl > 1:
+        darkpx = (g < paper * LINE_DARK).astype(np.int64)
+        cnt = np.bincount(ll.ravel(), minlength=nl)
+        dk = np.bincount(ll.ravel(), weights=darkpx.ravel(), minlength=nl)
+        keep_l = dk >= LINE_DARK_FRAC * np.maximum(cnt, 1)
+        keep_l[0] = False
+        lines = keep_l[ll].astype(np.uint8)
     r = max(2, int(w * INK_NEAR))
     keep = cv2.dilate(ink, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))) | \
         cv2.dilate(lines, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
@@ -759,11 +770,11 @@ def tone_map(norm):
     if color:
         # 밝기는 톤 곡선대로, 색(a, b)은 종이 색을 빼고 조금 진하게. 종이 부분은 순수한 흰색.
         # (RGB 에 같은 비율을 곱하면 밝은 색이 255 에서 잘려 색이 바래므로 Lab 에서 처리)
+        # 색이 있는 곳만 색을 남긴다. 검은 글자의 가장자리 색 번짐(카메라 색수차)은 무채색으로
         colored = np.clip((chroma - CHROMA_KEEP * 0.5) / CHROMA_KEEP, 0, 1)
-        fade = np.maximum(np.clip((1.0 - t) / 0.15, 0, 1), colored)
         Lp = lab[..., 0] + (y - g)
-        ap = 128.0 + (lab[..., 1] - a_p) * (COLOR_SAT * fade)
-        bp = 128.0 + (lab[..., 2] - b_p) * (COLOR_SAT * fade)
+        ap = 128.0 + (lab[..., 1] - a_p) * (COLOR_SAT * colored)
+        bp = 128.0 + (lab[..., 2] - b_p) * (COLOR_SAT * colored)
         out = cv2.cvtColor(np.clip(np.dstack([Lp, ap, bp]), 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR).astype(np.float32)
         out[(t >= 1) & (colored <= 0)] = 255.0
     else:

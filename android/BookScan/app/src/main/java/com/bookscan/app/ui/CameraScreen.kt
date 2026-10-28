@@ -146,7 +146,7 @@ private fun CameraContent(vm: MainViewModel, onOpenReview: () -> Unit) {
         CaptureReadiness {
             // 책 영역 모델(2.3MB)을 프리뷰 분석 스레드에서 올린다. 실패하면 책 위치 안내 없이 나머지만 판단
             if (!OpenCVLoader.initLocal()) null
-            else BookRegion(ctx.assets.open("u2netp.onnx").use { it.readBytes() })
+            else BookRegion(ctx.assets.open("u2netp.onnx").use { it.readBytes() }, threads = 2) // 보정 엔진과 CPU 를 나눠 씀
         }
     }
     val captureExecutor = remember { Executors.newSingleThreadExecutor() }

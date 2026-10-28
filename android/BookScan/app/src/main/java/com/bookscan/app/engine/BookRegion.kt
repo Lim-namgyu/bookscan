@@ -24,14 +24,14 @@ import kotlin.math.min
  *   - 곡면 편 결과에서 책 바깥(바닥 무늬)을 지우는 데 쓴다.
  * 입력은 RGB.
  */
-class BookRegion(modelBytes: ByteArray) : AutoCloseable {
+class BookRegion(modelBytes: ByteArray, threads: Int = 4) : AutoCloseable {
 
     private val env: OrtEnvironment = OrtEnvironment.getEnvironment()
     private val session: OrtSession = env.createSession(
         modelBytes,
         OrtSession.SessionOptions().apply {
             setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
-            setIntraOpNumThreads(4)
+            setIntraOpNumThreads(threads)
         }
     )
     private val inputName: String = session.inputNames.first()
