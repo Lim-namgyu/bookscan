@@ -1015,30 +1015,86 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         val sw = g.cols()
         val dark = Mat()
         Imgproc.threshold(g, dark, 199.0, 255.0, Imgproc.THRESH_BINARY_INV) // g < 200
-        g.release()
         val bl = max(2, (sw * (if (gutterSide == Side.LEFT) EDGE_GUTTER else EDGE_BAND)).toInt())
         val br = max(2, (sw * (if (gutterSide == Side.RIGHT) EDGE_GUTTER else EDGE_BAND)).toInt())
         val by = max(2, (sh * EDGE_BAND).toInt())
         val kv = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(1.0, max(5, (sh * 0.04).toInt()).toDouble()))
         val kh = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(max(5, (sw * 0.04).toInt()).toDouble(), 1.0))
-        val vert = Mat()
-        val horz = Mat()
-        Imgproc.morphologyEx(dark, vert, Imgproc.MORPH_OPEN, kv)
-        Imgproc.morphologyEx(dark, horz, Imgproc.MORPH_OPEN, kh)
-        kv.release(); kh.release()
-        val vb = ByteArray(sh * sw).also { vert.get(0, 0, it) }
-        val hb = ByteArray(sh * sw).also { horz.get(0, 0, it) }
-        vert.release(); horz.release()
         val mb = ByteArray(sh * sw)
         var any = false
-        for (y in 0 until sh) for (x in 0 until sw) {
-            val k = y * sw + x
-            val inX = x < bl || x >= sw - br
-            val inY = y < by || y >= sh - by
-            if ((inX && vb[k].toInt() != 0) || (inY && hb[k].toInt() != 0)) {
-                mb[k] = 255.toByte(); any = true
+        // 띠 안의 긴 선 조각마다: 상자 테두리(가로로 넓게 이어진 덩어리의 일부이고 페이지 위아래 끝에 닿지 않음)는 남기고,
+        // 페이지 경계선·접힌 곳 그림자(홀로 떨어진 선이거나 페이지 끝까지 이어진 선)는 지운다.
+        // 접힌 선 쪽 띠에서는 옅은 그림자 선(밝기 EDGE_FAINT 미만)까지 본다.
+        class Prep(val vert: ByteArray, val horz: ByteArray, val wide: BooleanArray, val tall: BooleanArray, val labels: IntArray)
+        val cache = HashMap<Int, Prep>()
+        fun prep(thr: Int): Prep = cache.getOrPut(thr) {
+            val d = Mat()
+            Imgproc.threshold(g, d, thr - 1.0, 255.0, Imgproc.THRESH_BINARY_INV) // g < thr
+            val v = Mat()
+            val hz = Mat()
+            Imgproc.morphologyEx(d, v, Imgproc.MORPH_OPEN, kv)
+            Imgproc.morphologyEx(d, hz, Imgproc.MORPH_OPEN, kh)
+            val lbl = Mat()
+            val st = Mat()
+            val cen = Mat()
+            val n = Imgproc.connectedComponentsWithStats(d, lbl, st, cen, 8, CvType.CV_32S)
+            val stats = IntArray(n * 5).also { st.get(0, 0, it) }
+            val labels = IntArray(sh * sw).also { lbl.get(0, 0, it) }
+            val p = Prep(
+                ByteArray(sh * sw).also { v.get(0, 0, it) }, ByteArray(sh * sw).also { hz.get(0, 0, it) },
+                BooleanArray(n) { stats[it * 5 + 2] > sw * EDGE_BOX }, BooleanArray(n) { stats[it * 5 + 3] > sh * EDGE_BOX }, labels
+            )
+            listOf(d, v, hz, lbl, st, cen).forEach { it.release() }
+            p
+        }
+        // (이름, 띠 x0, x1, y0, y1, 세로선인가)
+        val bands = listOf(
+            Triple(Side.LEFT, intArrayOf(0, bl, 0, sh), true), Triple(Side.RIGHT, intArrayOf(sw - br, sw, 0, sh), true),
+            Triple(null, intArrayOf(0, sw, 0, by), false), Triple(null, intArrayOf(0, sw, sh - by, sh), false)
+        )
+        for ((side, r, vertical) in bands) {
+            val pr = prep(if (side != null && side == gutterSide) EDGE_FAINT else 200)
+            val src = if (vertical) pr.vert else pr.horz
+            val segB = ByteArray(sh * sw)
+            for (y in r[2] until r[3]) for (x in r[0] until r[1]) segB[y * sw + x] = src[y * sw + x]
+            val segM = Mat(sh, sw, CvType.CV_8UC1).also { it.put(0, 0, segB) }
+            val sl = Mat()
+            val ss = Mat()
+            val sc = Mat()
+            val ns = Imgproc.connectedComponentsWithStats(segM, sl, ss, sc, 8, CvType.CV_32S)
+            val sst = IntArray(ns * 5).also { ss.get(0, 0, it) }
+            val slab = IntArray(sh * sw).also { sl.get(0, 0, it) }
+            listOf(segM, sl, ss, sc).forEach { it.release() }
+            val alongLo = if (vertical) by else bl
+            val alongHi = if (vertical) sh - by else sw - br
+            for (j in 1 until ns) {
+                val x0 = sst[j * 5]
+                val y0 = sst[j * 5 + 1]
+                val bw = sst[j * 5 + 2]
+                val bh = sst[j * 5 + 3]
+                var pix = 0
+                var big = 0
+                for (y in y0 until y0 + bh) for (x in x0 until x0 + bw) {
+                    val k = y * sw + x
+                    if (slab[k] != j) continue
+                    pix++
+                    val o = pr.labels[k]
+                    if (if (vertical) pr.wide[o] else pr.tall[o]) big++
+                }
+                val boxy = big > 0.5 * pix
+                val a0 = if (vertical) y0 else x0
+                val a1 = if (vertical) y0 + bh else x0 + bw
+                val reachesEnd = a0 <= alongLo || a1 >= alongHi
+                if (boxy && !reachesEnd) continue
+                for (y in y0 until y0 + bh) for (x in x0 until x0 + bw) {
+                    val k = y * sw + x
+                    if (slab[k] == j) {
+                        mb[k] = 255.toByte(); any = true
+                    }
+                }
             }
         }
+        kv.release(); kh.release(); g.release()
         // 띠 안의 가늘고 긴 조각
         run {
             val lbl = Mat()
@@ -1054,7 +1110,8 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
                 val y = stats[i * 5 + 1]
                 val bw = stats[i * 5 + 2]
                 val bh = stats[i * 5 + 3]
-                val sideLr = (x + bw <= bl || x >= sw - br) && bh >= 2.5 * bw && bh >= sh * 0.01
+                // 글자 획 하나(예: 'ㅣ')를 지우지 않도록 글자 높이보다 훨씬 긴 것만
+                val sideLr = (x + bw <= bl || x >= sw - br) && bh >= 2.5 * bw && bh >= sh * EDGE_BOX
                 // 위아래는 아주 긴 가로 조각(페이지 경계선)만: 글자 획 하나(예: '그'의 'ㅡ')를 지우지 않게
                 val sideTb = (y + bh <= by || y >= sh - by) && bw >= 8 * bh && bw >= sw * 0.05
                 hit[i] = sideLr || sideTb
@@ -1284,6 +1341,8 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         const val EDGE_BAND = 0.04
         const val EDGE_GUTTER = 0.06
         const val EDGE_TEXTURE = 0.08
+        const val EDGE_FAINT = 245 // 접힌 선 쪽 띠에서 그림자 선으로 볼 밝기 기준(이보다 어두우면)
+        const val EDGE_BOX = 0.03  // 가장자리 선이 이보다 넓게(세로선) / 높게(가로선) 이어진 덩어리에 속하면 상자 테두리로 보고 남김
 
         fun median(v: DoubleArray): Double = percentile(v, 50.0)
 

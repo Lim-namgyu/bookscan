@@ -774,19 +774,44 @@ def clean_edges(out, gutter_side=None):
     by = max(2, int(sh * EDGE_BAND))
     kv = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(5, int(sh * 0.04))))
     kh = cv2.getStructuringElement(cv2.MORPH_RECT, (max(5, int(sw * 0.04)), 1))
-    vert = cv2.morphologyEx(dark, cv2.MORPH_OPEN, kv)
-    horz = cv2.morphologyEx(dark, cv2.MORPH_OPEN, kh)
     m = np.zeros_like(dark)
-    m[:, :bl] |= vert[:, :bl]
-    m[:, sw - br:] |= vert[:, sw - br:]
-    m[:by, :] |= horz[:by, :]
-    m[sh - by:, :] |= horz[sh - by:, :]
-    # 띠 안의 가늘고 긴 조각: 좌우 띠는 세로로 긴 조각(책 옆면 줄), 위아래 띠는 아주 긴 가로 조각(페이지 경계선)만.
-    # (글자 획 하나 — 예: '그'의 'ㅡ' — 를 지우지 않도록 위아래는 엄격하게)
+    # 띠 안의 긴 선 조각마다: 상자 테두리(가로로 넓게 이어진 덩어리의 일부이고 페이지 위아래 끝에 닿지 않음)는 남기고,
+    # 페이지 경계선·접힌 곳 그림자(홀로 떨어진 선이거나 페이지 끝까지 이어진 선)는 지운다.
+    # 접힌 선 쪽 띠에서는 옅은 그림자 선(밝기 235 미만)까지 본다.
+    cache = {}
+
+    def prep(thr):
+        if thr not in cache:
+            d = (g < thr).astype(np.uint8) * 255
+            n_, lbl_, st_, _ = cv2.connectedComponentsWithStats(d, 8)
+            cache[thr] = (cv2.morphologyEx(d, cv2.MORPH_OPEN, kv), cv2.morphologyEx(d, cv2.MORPH_OPEN, kh),
+                          (st_[:, cv2.CC_STAT_WIDTH] > sw * EDGE_BOX)[lbl_], (st_[:, cv2.CC_STAT_HEIGHT] > sh * EDGE_BOX)[lbl_])
+        return cache[thr]
+
+    bands = [("left", (slice(None), slice(0, bl)), True), ("right", (slice(None), slice(sw - br, sw)), True),
+             ("top", (slice(0, by), slice(None)), False), ("bottom", (slice(sh - by, sh), slice(None)), False)]
+    for name, sl_, vertical in bands:
+        vert, horz, wide, tall = prep(EDGE_FAINT if name == gutter_side else 200)
+        seg_mask = np.zeros_like(dark)
+        seg_mask[sl_] = (vert if vertical else horz)[sl_]
+        owner_big = wide if vertical else tall
+        along_lo, along_hi = (by, sh - by) if vertical else (bl, sw - br)
+        ns, sl, ss, _ = cv2.connectedComponentsWithStats(seg_mask, 8)
+        for j in range(1, ns):
+            x, y, bw, bh, _ = ss[j]
+            pix = sl[y:y + bh, x:x + bw] == j
+            boxy = owner_big[y:y + bh, x:x + bw][pix].mean() > 0.5
+            a0, a1 = (y, y + bh) if vertical else (x, x + bw)
+            reaches_end = a0 <= along_lo or a1 >= along_hi
+            if boxy and not reaches_end:
+                continue
+            m[y:y + bh, x:x + bw][pix] = 255
     n, lbl, st, _ = cv2.connectedComponentsWithStats(dark, 8)
+    # 띠 안의 가늘고 긴 조각: 좌우 띠는 세로로 긴 조각(책 옆면 줄), 위아래 띠는 아주 긴 가로 조각(페이지 경계선)만.
+    # (글자 획 하나 — 예: 'ㅣ', '그'의 'ㅡ' — 를 지우지 않도록 글자 높이보다 훨씬 긴 것만)
     for i in range(1, n):
         x, y, bw, bh, _ = st[i]
-        side_lr = (x + bw <= bl or x >= sw - br) and bh >= 2.5 * bw and bh >= sh * 0.01
+        side_lr = (x + bw <= bl or x >= sw - br) and bh >= 2.5 * bw and bh >= sh * EDGE_BOX
         side_tb = (y + bh <= by or y >= sh - by) and bw >= 8 * bh and bw >= sw * 0.05
         if side_lr or side_tb:
             m[y:y + bh, x:x + bw][lbl[y:y + bh, x:x + bw] == i] = 255
@@ -814,6 +839,8 @@ def clean_edges(out, gutter_side=None):
 
 
 EDGE_TEXTURE = 0.08
+EDGE_FAINT = 245      # 접힌 선 쪽 띠에서 그림자 선으로 볼 밝기 기준(이보다 어두우면)
+EDGE_BOX = 0.03       # 가장자리 선이 이보다 넓게(세로선) / 높게(가로선) 이어진 덩어리에 속하면 상자 테두리로 보고 남김
 EDGE_BAND = 0.04
 EDGE_GUTTER = 0.06
 
