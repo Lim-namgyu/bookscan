@@ -10,7 +10,9 @@ import kotlin.math.abs
 import kotlin.math.atan
 import kotlin.math.ceil
 import kotlin.math.cos
+import kotlin.math.exp
 import kotlin.math.floor
+import kotlin.math.ln
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -38,6 +40,16 @@ object Straightener {
 
     /** 여백선 기울기와 글자 세로획 각도가 이보다(도) 다르면 덜 기울인 쪽을 믿음 */
     private const val MARGIN_STEM_TOL = 2.0
+
+    // 세로 배율 보정 (engine/straighten.py 의 SCALE_* 와 같은 값)
+    private const val SCALE_MIN_LINES = 8      // 보정에 필요한 최소 글줄 수
+    private const val SCALE_MIN_GLYPHS = 8     // 글줄마다 있어야 하는 글자 수
+    private const val SCALE_CLAMP_LO = 0.85
+    private const val SCALE_CLAMP_HI = 1.18
+    private const val SCALE_INLIER_FRAC = 0.5  // 글줄의 이 비율 이상이 추세에 맞아야
+    private const val SCALE_RESID_MAX = 0.03   // 추세를 뺀 글자 높이 흩어짐(log) 최대
+    private const val SCALE_SPREAD_MIN = 0.5   // 추세에 맞는 줄들이 페이지 높이의 이 비율 이상에 걸쳐야
+    private const val SCALE_QUART_MIN = 2      // 그 범위를 넷으로 나눴을 때 칸마다 최소 줄 수
 
     /** 입력: RGB(8UC3) 또는 GRAY(8UC1). 글자가 너무 적으면 null */
     fun maps(img: Mat): Maps? {
@@ -579,6 +591,131 @@ object Straightener {
 
     // ================================================================= 본체
 
+    // ================================================================= 세로 배율 (글자 몸통 띠 두께)
+
+    /**
+     * 글줄 하나의 '글자 몸통 띠' 두께(픽셀, 소수). 글줄 중심선을 따라 세로 방향 잉크 분포를 모은 뒤
+     * 최대값의 절반이 되는 위아래 지점 사이 거리를 보간해서 잰다 — 글자 하나하나의 정수 높이와 달리
+     * 줄 전체 평균이라 1px 아래까지 매끈하게 변한다 (라틴 글자는 x-높이, 한글·한자는 글자 높이).
+     * src: 글자 마스크(0/255) 바이트, rows x cols.
+     */
+    private fun bandHeight(src: ByteArray, rows: Int, cols: Int, l: Line, ch: Double, offs: DoubleArray): Double? {
+        val xa = ceil(l.x0).toInt()
+        val xb = floor(l.x1).toInt()
+        val n = xb - xa + 1
+        if (n < ch * 4) return null
+        val prof = DoubleArray(offs.size)
+        for (x in xa..xb) {
+            if (x < 0 || x >= cols) continue
+            val yc = interp(x.toDouble(), l.kx, l.ky)
+            for (k in offs.indices) {
+                val yy = yc + offs[k]
+                val y0 = floor(yy).toInt()
+                val fy = yy - y0
+                val v0 = if (y0 in 0 until rows) (src[y0 * cols + x].toInt() and 0xFF).toDouble() else 0.0
+                val v1 = if (y0 + 1 in 0 until rows) (src[(y0 + 1) * cols + x].toInt() and 0xFF).toDouble() else 0.0
+                prof[k] += v0 * (1 - fy) + v1 * fy
+            }
+        }
+        for (k in prof.indices) prof[k] /= n
+        var pk = 0
+        for (k in prof.indices) if (prof[k] > prof[pk]) pk = k
+        if (prof[pk] <= 0) return null
+        val half = prof[pk] * 0.5
+        var i = pk
+        while (i > 0 && prof[i - 1] >= half) i--
+        var j = pk
+        while (j < prof.size - 1 && prof[j + 1] >= half) j++
+        if (i == 0 || j == prof.size - 1) return null
+        val step = offs[1] - offs[0]
+        val lo = offs[i] - step * (prof[i] - half) / max(prof[i] - prof[i - 1], 1e-6)
+        val hi = offs[j] + step * (prof[j] - half) / max(prof[j] - prof[j + 1], 1e-6)
+        return hi - lo
+    }
+
+    /**
+     * 곡면 펴기가 덜 된 곳(페이지 끝이 카메라 쪽으로 말린 곳)은 글자가 커진다 → 글줄마다 글자 몸통 띠 두께를 재서
+     * 세로 위치에 따른 배율 r(v) 를 매끈하게(1차, 줄이 많으면 2차) 맞춘다. 반환: r(v) 배열(길이 h) 또는 null.
+     * 좌우 배율은 여백선 보정이 이미 맞추므로 세로만 다룬다. (engine/straighten.py _vertical_scale 와 같음)
+     */
+    private fun verticalScale(clean: Mat, lines: List<Line>, ch: Double, h: Int): DoubleArray? {
+        if (lines.size < SCALE_MIN_LINES) return null
+        val cc = components(clean, false)
+        if (cc.n < 2) return null
+        val rows = clean.rows()
+        val cols = clean.cols()
+        val src = ByteArray(rows * cols)
+        clean.get(0, 0, src)
+        val nOff = floor(3.0 * ch / 0.25 + 1e-3).toInt() + 1
+        val offs = DoubleArray(nOff) { -1.5 * ch + 0.25 * it }
+        val ok = BooleanArray(cc.n) { i ->
+            i != 0 && cc.h(i) >= ch * 0.5 && cc.h(i) <= ch * 2.0 && cc.w(i) <= ch * 3.0
+        }
+        val T = ArrayList<Double>()
+        val H = ArrayList<Double>()
+        for (l in lines) {
+            var inSpan = 0
+            var near = 0
+            for (i in 1 until cc.n) {
+                if (!ok[i] || cc.cx[i] < l.x0 || cc.cx[i] > l.x1) continue
+                inSpan++
+                if (abs(cc.cy[i] - interp(cc.cx[i], l.kx, l.ky)) < ch * 0.6) near++
+            }
+            if (inSpan < SCALE_MIN_GLYPHS || near < SCALE_MIN_GLYPHS) continue // 글자가 있는 줄만 (괘선 제외)
+            val bh = bandHeight(src, rows, cols, l, ch, offs) ?: continue
+            if (bh < ch * 0.3) continue
+            T.add(l.t); H.add(bh)
+        }
+        if (T.size < SCALE_MIN_LINES) return null
+        val n = T.size
+        val y = DoubleArray(n) { T[it] / h }
+        val medH = median(H.toDoubleArray())
+        val lr = DoubleArray(n) { ln(H[it] / medH) }
+        val deg = if (n >= 15) 2 else 1
+        var keep = BooleanArray(n) { true }
+        var poly: Poly? = null
+        var res = DoubleArray(n)
+        for (iter in 0 until 3) {
+            val kk = keep
+            val idx = kk.indices.filter { kk[it] }
+            if (idx.size < deg + 4) return null
+            val p = polyfit(DoubleArray(idx.size) { y[idx[it]] }, DoubleArray(idx.size) { lr[idx[it]] }, deg) ?: return null
+            poly = p
+            val r = DoubleArray(n) { lr[it] - p.eval(y[it]) }
+            res = r
+            val rk = DoubleArray(idx.size) { r[idx[it]] }
+            val medR = median(rk)
+            val mad = median(DoubleArray(rk.size) { abs(rk[it] - medR) }) + 1e-6
+            val tol = max(2.5 * mad, 0.03)
+            keep = BooleanArray(n) { abs(r[it]) < tol }
+        }
+        val p = poly ?: return null
+        val kept = keep.indices.filter { keep[it] }
+        // 글자 크기가 섞인 쪽(제목·본문·보기가 다른 크기)에서는 '높이 변화 = 말림' 이라 볼 수 없다:
+        // 본문처럼 글자 크기가 고른 쪽(추세를 뺀 흩어짐이 작고 대부분이 추세에 맞음)에서만 보정
+        if (kept.size.toDouble() / n < SCALE_INLIER_FRAC) return null
+        val meanR = kept.sumOf { res[it] } / kept.size
+        val sd = sqrt(kept.sumOf { (res[it] - meanR) * (res[it] - meanR) } / kept.size)
+        if (sd > SCALE_RESID_MAX) return null
+        // 추세에 맞는 줄이 페이지 전체에 고르게 있어야 한다 ('크기가 다른 두 구역'을 말림으로 잘못 읽지 않도록)
+        val yk = DoubleArray(kept.size) { y[kept[it]] }
+        val yMin = yk.min()
+        val yMax = yk.max()
+        val span = yMax - yMin
+        if (span < SCALE_SPREAD_MIN) return null
+        val quart = IntArray(4)
+        for (v in yk) quart[min(((v - yMin) / span * 4).toInt(), 3)]++
+        if (quart.min() < SCALE_QUART_MIN) return null
+        // 글줄이 있는 범위 밖으로는 끝값을 그대로 이어서 과한 외삽을 막는다. 가운데(중앙값 위치)를 기준 1로
+        val ref = exp(p.eval(median(yk)))
+        val r = DoubleArray(h) { exp(p.eval((it.toDouble() / h).coerceIn(yMin, yMax))) / ref }
+        var maxLog = 0.0
+        for (v in r) maxLog = max(maxLog, abs(ln(v)))
+        if (maxLog < 0.02) return null // 2% 미만이면 손대지 않음
+        for (k in r.indices) r[k] = r[k].coerceIn(SCALE_CLAMP_LO, SCALE_CLAMP_HI)
+        return r
+    }
+
     private fun core(gray: Mat, clean: Mat, chIn: Double, phi: Double): Maps {
         val h = gray.rows()
         val w = gray.cols()
@@ -721,6 +858,22 @@ object Straightener {
             return a * (1 - fy) + b * fy
         }
 
+        // ---- 세로 배율: 글자 높이가 커지는 곳(덜 펴진 말림)은 줄여서 글자 크기를 고르게
+        //  입력 행 v 에서 배율 rv[v] → 출력에서는 1/rv 만큼 촘촘히 표본. g(v) = ∫ 1/rv, 출력 행 → 입력 행은 g 의 역함수
+        val rv = verticalScale(clean, lines, ch, h)
+        val hOut: Int
+        val vinOf: (Double) -> Double
+        if (rv != null) {
+            val gAcc = DoubleArray(h + 1)
+            for (k in 0 until h) gAcc[k + 1] = gAcc[k] + 1.0 / rv[k]
+            val idx = DoubleArray(h + 1) { it.toDouble() }
+            hOut = gAcc[h].roundToInt()
+            vinOf = { vq -> interp(vq, gAcc, idx) }
+        } else {
+            hOut = h
+            vinOf = { vq -> vq }
+        }
+
         // ---- 보정으로 화면 밖으로 밀려나는 내용이 없도록 캔버스를 넓힘 (머리글·쪽번호 잘림 방지)
         val cTop = rowCoef(0.0)
         val cBot = rowCoef(h - 1.0)
@@ -732,8 +885,8 @@ object Straightener {
         }
         var leftMost = -Double.MAX_VALUE
         var rightMost = -Double.MAX_VALUE
-        for (v in 0 until h) {
-            val cf = rowCoef(v.toDouble())
+        for (vo in 0 until hOut) {
+            val cf = rowCoef(vinOf(vo.toDouble()))
             leftMost = max(leftMost, cf[0])
             rightMost = max(rightMost, (w - 1.0) - (cf[0] + cf[1] * (w - 1.0)))
         }
@@ -742,17 +895,22 @@ object Straightener {
         val padL = min(ceil(max(0.0, leftMost)).toInt(), (w * 0.1).toInt())
         val padR = min(ceil(max(0.0, rightMost)).toInt(), (w * 0.1).toInt())
         val W2 = w + padL + padR
-        val H2 = h + padT + padB
+        val H2 = hOut + padT + padB
 
-        // ---- 출력 픽셀 (u, v) = (i − padL, j − padT) → 입력 (xv, v + d(xv, v))
+        // ---- 출력 픽셀 (u, vo) = (i − padL, j − padT) → 입력 행 v (세로 배율 보정; 캔버스 밖 여유 부분은 그대로 이어짐)
+        //      → 입력 (xv, v + d(xv, v))
+        val vIn = DoubleArray(H2) { j ->
+            val vo = (j - padT).toDouble()
+            if (vo < 0) vo else if (vo > hOut - 1) vo - hOut + h else vinOf(vo.coerceIn(0.0, hOut - 1.0))
+        }
         val buf = FloatArray(H2 * W2)
         for (j in 0 until H2) {
-            val cf = rowCoef((j - padT).toDouble())
+            val cf = rowCoef(vIn[j])
             for (i in 0 until W2) buf[j * W2 + i] = (cf[0] + cf[1] * (i - padL)).toFloat()
         }
         val mapX = Mat(H2, W2, CvType.CV_32F).also { it.put(0, 0, buf) }
         for (j in 0 until H2) {
-            val v = (j - padT).toFloat()
+            val v = vIn[j].toFloat()
             for (i in 0 until W2) buf[j * W2 + i] = v
         }
         val vM = Mat(H2, W2, CvType.CV_32F).also { it.put(0, 0, buf) }

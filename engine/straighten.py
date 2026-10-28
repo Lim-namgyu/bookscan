@@ -231,6 +231,125 @@ STEM_MAX = 6.0  # 곡면 펴기 뒤 남는 비틀림은 이보다 작다. 더 �
 MARGIN_STEM_TOL = 2.0  # 여백선 기울기와 글자 세로획 각도가 이보다(도) 다르면 덜 기울인 쪽을 믿음
 
 
+
+SCALE_MIN_LINES = 8      # 세로 배율 보정에 필요한 최소 글줄 수
+SCALE_MIN_GLYPHS = 8     # 글줄마다 재는 글자 수 최소
+SCALE_CLAMP = (0.85, 1.18)
+SCALE_INLIER_FRAC = 0.5  # 글줄의 이 비율 이상이 추세에 맞아야 (제목·재료 목록 같은 다른 크기 줄은 빠짐)
+SCALE_RESID_MAX = 0.03   # 추세를 뺀 글자 높이 흩어짐(log) 최대
+SCALE_SPREAD_MIN = 0.5   # 추세에 맞는 줄들이 페이지 높이의 이 비율 이상에 걸쳐 있어야
+SCALE_QUART_MIN = 2      # 그 범위를 넷으로 나눴을 때 칸마다 최소 줄 수
+DEBUG = None
+
+
+def _band_height(src, L, ch, offs):
+    """
+    글줄 하나의 '글자 몸통 띠' 두께(픽셀, 소수). 글줄 중심선을 따라 세로 방향 잉크 분포를 모은 뒤
+    최대값의 절반이 되는 위아래 지점 사이 거리를 보간해서 잰다 — 글자 하나하나의 정수 높이와 달리
+    줄 전체 평균이라 1px 아래까지 매끈하게 변한다 (라틴 글자는 x-높이, 한글·한자는 글자 높이).
+    """
+    coef, kx, ky, x0, x1, t = L
+    xs = np.arange(int(np.ceil(x0)), int(np.floor(x1)) + 1, dtype=np.float32)
+    if len(xs) < ch * 4:
+        return None
+    yc = np.interp(xs, kx, ky)
+    yy = yc[None, :] + offs[:, None].astype(np.float64)  # (offs, cols) 표본 행 위치
+    y0 = np.floor(yy).astype(np.int64)
+    fy = (yy - y0).astype(np.float32)
+    hh = src.shape[0]
+    xi = xs.astype(np.int64)[None, :]
+    v0 = np.where((y0 >= 0) & (y0 < hh), src[np.clip(y0, 0, hh - 1), xi], 0.0)
+    v1 = np.where((y0 + 1 >= 0) & (y0 + 1 < hh), src[np.clip(y0 + 1, 0, hh - 1), xi], 0.0)
+    prof = (v0 * (1 - fy) + v1 * fy).mean(axis=1)  # 열 방향 평균 → 세로 잉크 분포 (행 사이는 선형 보간)
+    pk = int(np.argmax(prof))
+    half = prof[pk] * 0.5
+    if prof[pk] <= 0:
+        return None
+    i = pk
+    while i > 0 and prof[i - 1] >= half:
+        i -= 1
+    j = pk
+    while j < len(prof) - 1 and prof[j + 1] >= half:
+        j += 1
+    if i == 0 or j == len(prof) - 1:
+        return None
+    step = float(offs[1] - offs[0])
+    lo = offs[i] - step * (prof[i] - half) / max(prof[i] - prof[i - 1], 1e-6)
+    hi = offs[j] + step * (prof[j] - half) / max(prof[j] - prof[j + 1], 1e-6)
+    return float(hi - lo)
+
+
+def _vertical_scale(gray_clean, lines, ch, h):
+    """
+    곡면 펴기가 덜 된 곳(페이지 끝이 카메라 쪽으로 말린 곳)은 글자가 커진다 → 글줄마다 글자 몸통 띠 두께를 재서
+    세로 위치에 따른 배율 r(v) 를 매끈하게(1차, 줄이 많으면 2차) 맞춘다. 반환: r(v) 배열(길이 h) 또는 None.
+    좌우 배율은 여백선 보정이 이미 맞추므로 세로만 다룬다.
+    """
+    n, lbl, st, cen = cv2.connectedComponentsWithStats(gray_clean, 8)
+    if n < 2 or len(lines) < SCALE_MIN_LINES:
+        return None
+    cx, cy = cen[1:, 0], cen[1:, 1]
+    hs = st[1:, cv2.CC_STAT_HEIGHT].astype(np.float64)
+    ws = st[1:, cv2.CC_STAT_WIDTH].astype(np.float64)
+    ok = (hs >= ch * 0.5) & (hs <= ch * 2.0) & (ws <= ch * 3.0)
+    src = gray_clean.astype(np.float32)
+    offs = np.arange(-1.5 * ch, 1.5 * ch + 1e-3, 0.25)
+    T, H = [], []
+    for L in lines:
+        coef, kx, ky, x0, x1, t = L
+        sel = ok & (cx >= x0) & (cx <= x1)
+        if sel.sum() < SCALE_MIN_GLYPHS:
+            continue
+        yl = np.interp(cx[sel], kx, ky)
+        if (np.abs(cy[sel] - yl) < ch * 0.6).sum() < SCALE_MIN_GLYPHS:  # 글자가 있는 줄만 (괘선 제외)
+            continue
+        bh = _band_height(src, L, ch, offs)
+        if bh is None or bh < ch * 0.3:
+            continue
+        T.append(t)
+        H.append(bh)
+    if len(T) < SCALE_MIN_LINES:
+        return None
+    T, H = np.array(T), np.array(H)
+    y = T / h
+    lr = np.log(H / np.median(H))
+    deg = 2 if len(T) >= 15 else 1
+    keep = np.ones(len(T), bool)
+    coef = None
+    for _ in range(3):
+        if keep.sum() < deg + 4:
+            return None
+        coef = np.polyfit(y[keep], lr[keep], deg)
+        res = lr - np.polyval(coef, y)
+        mad = np.median(np.abs(res[keep] - np.median(res[keep]))) + 1e-6
+        keep = np.abs(res) < max(2.5 * mad, 0.03)
+    # 글자 크기가 섞인 쪽(제목·본문·보기가 다른 크기)에서는 '높이 변화 = 말림' 이라 볼 수 없다:
+    # 본문처럼 글자 크기가 고른 쪽(추세를 뺀 흩어짐이 작고 대부분이 추세에 맞음)에서만 보정
+    if DEBUG is not None:
+        DEBUG.update(lines=len(T), inl=round(float(keep.mean()), 2), resid=round(float(np.std(res[keep])), 3),
+                     rng=(round(float(np.exp(np.polyval(coef, y[keep].min()))), 3), round(float(np.exp(np.polyval(coef, y[keep].max()))), 3)),
+                     data=[(round(float(a), 2), round(float(b), 2), bool(k)) for a, b, k in zip(y, H, keep)])
+    if keep.mean() < SCALE_INLIER_FRAC or np.std(res[keep]) > SCALE_RESID_MAX:
+        return None
+    # 추세에 맞는 줄이 페이지 전체에 고르게 있어야 한다 (위쪽 큰 글자 묶음 + 아래쪽 작은 글자 묶음 같은
+    # '크기가 다른 두 구역'을 말림으로 잘못 읽지 않도록)
+    yk = y[keep]
+    span = yk.max() - yk.min()
+    if span < SCALE_SPREAD_MIN:
+        return None
+    q = np.minimum(((yk - yk.min()) / span * 4).astype(int), 3)
+    if np.bincount(q, minlength=4).min() < SCALE_QUART_MIN:
+        return None
+    # 글줄이 있는 범위 밖으로는 끝값을 그대로 이어서 과한 외삽을 막는다
+    v = np.arange(h, dtype=np.float64) / h
+    vc = np.clip(v, y[keep].min(), y[keep].max())
+    r = np.exp(np.polyval(coef, vc))
+    r = r / np.exp(np.polyval(coef, np.median(y[keep])))  # 가운데(중앙값 위치)를 기준 1로
+    if np.abs(np.log(r)).max() < 0.02:  # 2% 미만이면 손대지 않음
+        return None
+    return np.clip(r, *SCALE_CLAMP)
+
+
 def _straighten_core(gray, clean, ch, phi):
     """
     페이지를 '회전'하지 않는다. 회전하면, 글줄만 기울고 글자는 똑바로 선 경우(곡면 펴기 잔여 비틀림)에
@@ -342,23 +461,36 @@ def _straighten_core(gray, clean, ch, phi):
         vq = np.asarray(vq, np.float32).reshape(1, -1) / gstep
         return cv2.remap(dfield, xq, vq, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE).ravel()
 
+    # ---- 세로 배율: 글자 높이가 커지는 곳(덜 펴진 말림)은 줄여서 글자 크기를 고르게
+    rv = _vertical_scale(clean, lines, ch, h)
+    if rv is not None:
+        # 입력 행 v 에서 배율 rv[v] → 출력에서는 1/rv 만큼 촘촘히 샘플. g(v) = ∫ 1/rv, 출력 행 → 입력 행은 g 의 역함수
+        g_acc = np.concatenate([[0.0], np.cumsum(1.0 / rv)])  # 길이 h+1, g(v) at v=0..h
+        h_out = int(round(g_acc[-1]))
+        vin_of = lambda vq: np.interp(np.asarray(vq, np.float64), g_acc, np.arange(h + 1, dtype=np.float64))
+    else:
+        h_out = h
+        vin_of = lambda vq: np.asarray(vq, np.float64)
+
     # ---- 보정으로 화면 밖으로 밀려나는 내용이 없도록 캔버스를 넓힘 (머리글·쪽번호 잘림 방지)
     ur = np.arange(w, dtype=np.float64)
-    vr = np.arange(h, dtype=np.float64)
+    vr = vin_of(np.arange(h_out, dtype=np.float64))
     top = d_at(xv_at(ur, np.zeros(w)), np.zeros(w))
     bot = d_at(xv_at(ur, np.full(w, h - 1.0)), np.full(w, h - 1.0))
     pad_t = min(int(np.ceil(max(0.0, float(top.max())))), int(h * 0.1))
     pad_b = min(int(np.ceil(max(0.0, -float(bot.min())))), int(h * 0.1))
-    pad_l = min(int(np.ceil(max(0.0, float(xv_at(np.zeros(h), vr).max())))), int(w * 0.1))
-    pad_r = min(int(np.ceil(max(0.0, float(((w - 1.0) - xv_at(np.full(h, w - 1.0), vr)).max())))), int(w * 0.1))
+    pad_l = min(int(np.ceil(max(0.0, float(xv_at(np.zeros(len(vr)), vr).max())))), int(w * 0.1))
+    pad_r = min(int(np.ceil(max(0.0, float(((w - 1.0) - xv_at(np.full(len(vr), w - 1.0), vr)).max())))), int(w * 0.1))
 
-    uu, vv = np.meshgrid(np.arange(-pad_l, w + pad_r, dtype=np.float32), np.arange(-pad_t, h + pad_b, dtype=np.float32))
+    uu, vo = np.meshgrid(np.arange(-pad_l, w + pad_r, dtype=np.float32), np.arange(-pad_t, h_out + pad_b, dtype=np.float32))
+    # 출력 행 → 입력 행 (세로 배율 보정; 캔버스 밖 여유 부분은 그대로 이어짐)
+    vv = np.where(vo < 0, vo, np.where(vo > h_out - 1, vo - h_out + h, vin_of(np.clip(vo, 0, h_out - 1)))).astype(np.float32)
     xv = xv_at(uu, vv).astype(np.float32)
     # ---- 세로 보정: d(x_v, v) 거친 격자 → 픽셀 단위 보간
     dmap = cv2.remap(dfield, xv / gstep, vv / gstep, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
     mapx = xv
     mapy = (vv + dmap).astype(np.float32)
     info = dict(skew=phi, lines=len(lines), left=a_l is not None, right=a_r is not None, ch=ch, stem=stem,
-                pad=(pad_t, pad_b, pad_l, pad_r),
+                pad=(pad_t, pad_b, pad_l, pad_r), vscale=(float(rv.min()), float(rv.max())) if rv is not None else None,
                 dmax=float(np.nanmax(np.abs(dfield))) if dfield.size else 0.0)
     return mapx, mapy, info
