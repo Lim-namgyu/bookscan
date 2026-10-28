@@ -1269,7 +1269,12 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
                 val sideLr = (x + bw <= bl || x >= sw - br) && bh >= 2.5 * bw && bh >= sh * EDGE_BOX
                 // 위아래는 아주 긴 가로 조각(페이지 경계선)만: 글자 획 하나(예: '그'의 'ㅡ')를 지우지 않게
                 val sideTb = (y + bh <= by || y >= sh - by) && bw >= 8 * bh && bw >= sw * 0.05
-                hit[i] = sideLr || sideTb
+                // 변에 닿은 가늘고 짧은 획(책 옆면 종이 단면·바닥 줄이 페이지 끝까지 이어진 것). 글자는 변에 닿지 않는다
+                val touch = x == 0 || y == 0 || x + bw == sw || y + bh == sh
+                val long = max(bw, bh)
+                val short = min(bw, bh)
+                val stroke = touch && long >= 2.5 * short && short <= sw * EDGE_STROKE_THIN && long <= sh * EDGE_STROKE_MAX
+                hit[i] = sideLr || sideTb || stroke
             }
             for (k in 0 until sh * sw) if (hit[labels[k]]) {
                 mb[k] = 255.toByte(); any = true
@@ -1530,6 +1535,8 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         const val EDGE_BAND = 0.04
         const val EDGE_GUTTER = 0.06
         const val EDGE_TEXTURE = 0.08
+        const val EDGE_STROKE_THIN = 0.006 // 변에 닿은 획을 지울 최대 굵기(페이지 폭 비율)
+        const val EDGE_STROKE_MAX = 0.10   // 변에 닿은 획을 지울 최대 길이(페이지 높이 비율)
         const val EDGE_FAINT = 245 // 접힌 선 쪽 띠에서 그림자 선으로 볼 밝기 기준(이보다 어두우면)
         const val EDGE_BOX = 0.03  // 가장자리 선이 이보다 넓게(세로선) / 높게(가로선) 이어진 덩어리에 속하면 상자 테두리로 보고 남김
 

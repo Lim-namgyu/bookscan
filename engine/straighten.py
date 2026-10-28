@@ -249,7 +249,8 @@ def _band_height(src, L, ch, offs):
     줄 전체 평균이라 1px 아래까지 매끈하게 변한다 (라틴 글자는 x-높이, 한글·한자는 글자 높이).
     """
     coef, kx, ky, x0, x1, t = L
-    xs = np.arange(int(np.ceil(x0)), int(np.floor(x1)) + 1, dtype=np.float32)
+    # 글줄 표본은 기울기를 되돌린 좌표라 그림 밖으로 조금 나갈 수 있다 → 그림 안의 열만
+    xs = np.arange(max(0, int(np.ceil(x0))), min(src.shape[1] - 1, int(np.floor(x1))) + 1, dtype=np.float32)
     if len(xs) < ch * 4:
         return None
     yc = np.interp(xs, kx, ky)

@@ -600,13 +600,13 @@ object Straightener {
      * src: 글자 마스크(0/255) 바이트, rows x cols.
      */
     private fun bandHeight(src: ByteArray, rows: Int, cols: Int, l: Line, ch: Double, offs: DoubleArray): Double? {
-        val xa = ceil(l.x0).toInt()
-        val xb = floor(l.x1).toInt()
+        // 글줄 표본은 기울기를 되돌린 좌표라 그림 밖으로 조금 나갈 수 있다 → 그림 안의 열만
+        val xa = max(0, ceil(l.x0).toInt())
+        val xb = min(cols - 1, floor(l.x1).toInt())
         val n = xb - xa + 1
         if (n < ch * 4) return null
         val prof = DoubleArray(offs.size)
         for (x in xa..xb) {
-            if (x < 0 || x >= cols) continue
             val yc = interp(x.toDouble(), l.kx, l.ky)
             for (k in offs.indices) {
                 val yy = yc + offs[k]

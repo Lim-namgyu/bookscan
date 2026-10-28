@@ -874,7 +874,11 @@ def clean_edges(out, gutter_side=None):
         x, y, bw, bh, _ = st[i]
         side_lr = (x + bw <= bl or x >= sw - br) and bh >= 2.5 * bw and bh >= sh * EDGE_BOX
         side_tb = (y + bh <= by or y >= sh - by) and bw >= 8 * bh and bw >= sw * 0.05
-        if side_lr or side_tb:
+        # 변에 닿은 가늘고 짧은 획(책 옆면 종이 단면·바닥 줄이 페이지 끝까지 이어진 것). 글자는 변에 닿지 않는다
+        touch = x == 0 or y == 0 or x + bw == sw or y + bh == sh
+        long_, short = max(bw, bh), min(bw, bh)
+        stroke = touch and long_ >= 2.5 * short and short <= sw * EDGE_STROKE_THIN and long_ <= sh * EDGE_STROKE_MAX
+        if side_lr or side_tb or stroke:
             m[y:y + bh, x:x + bw][lbl[y:y + bh, x:x + bw] == i] = 255
     # 좌우 변에 붙은 세로 잔무늬 띠(바닥 카펫·책 옆면 찌꺼기): 어두운 점이 빽빽한 곳이 변에 닿아 있고
     # 안쪽으로 얕게(8% 이내)만 들어왔으며 세로로 긴 것. 글줄(가로로 긴 덩어리)은 건드리지 않는다.
@@ -900,6 +904,8 @@ def clean_edges(out, gutter_side=None):
 
 
 EDGE_TEXTURE = 0.08
+EDGE_STROKE_THIN = 0.006  # 변에 닿은 획을 지울 최대 굵기(페이지 폭 비율)
+EDGE_STROKE_MAX = 0.10    # 변에 닿은 획을 지울 최대 길이(페이지 높이 비율)
 EDGE_FAINT = 245      # 접힌 선 쪽 띠에서 그림자 선으로 볼 밝기 기준(이보다 어두우면)
 EDGE_BOX = 0.03       # 가장자리 선이 이보다 넓게(세로선) / 높게(가로선) 이어진 덩어리에 속하면 상자 테두리로 보고 남김
 EDGE_BAND = 0.04
