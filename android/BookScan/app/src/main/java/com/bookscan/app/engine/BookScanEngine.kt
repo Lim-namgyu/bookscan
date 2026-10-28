@@ -56,13 +56,20 @@ class BookScanEngine(modelBytes: ByteArray) : AutoCloseable {
 
     /** 1단계: 사진(RGB) → 곡면 편 페이지 목록 (양면이면 2장) */
     fun dewarpPages(rgb: Mat, layout: Layout): List<DewarpedPage> {
-        val gutter = if (layout == Layout.SINGLE) null else findGutter(rgb, layout == Layout.DOUBLE)
-        val parts = if (gutter != null) splitSpread(rgb, gutter) else listOf(rgb)
-        return parts.mapIndexed { i, p ->
-            val flat = rectify(p)
-            if (p !== rgb) p.release()
-            val skip = if (parts.size == 1) null else if (i == 0) Side.RIGHT else Side.LEFT
-            DewarpedPage(flat, skip)
+        // 폰을 세로로 든 채 펼친 책을 찍으면 글이 옆으로 누워 있음 → 글이 바로 서도록 먼저 돌림
+        val rot = PageAnalysis.detectRotation(rgb)
+        val src = if (rot != 0) PageAnalysis.rotate(rgb, rot) else rgb
+        try {
+            val gutter = if (layout == Layout.SINGLE) null else PageAnalysis.findGutter(src, layout == Layout.DOUBLE)
+            val parts = if (gutter != null) splitSpread(src, gutter) else listOf(src)
+            return parts.mapIndexed { i, p ->
+                val flat = rectify(p)
+                if (p !== src) p.release()
+                val skip = if (parts.size == 1) null else if (i == 0) Side.RIGHT else Side.LEFT
+                DewarpedPage(flat, skip)
+            }
+        } finally {
+            if (src !== rgb) src.release()
         }
     }
 
@@ -77,83 +84,11 @@ class BookScanEngine(modelBytes: ByteArray) : AutoCloseable {
         norm.release()
         if (hasMask) erase(out, mask!!)
         mask?.release()
+        cleanEdges(out)
         return out
     }
 
     // ================================================================= 1. 양면 분리
-
-    /** 양면 펼침이면 접힌 선을 x = a*y + b (원본 좌표) 로 반환, 아니면 null */
-    private fun findGutter(img: Mat, force: Boolean): Pair<Double, Double>? {
-        val w = img.cols()
-        val h = img.rows()
-        val s = 600.0 / w
-        val small = Mat()
-        Imgproc.resize(img, small, Size(600.0, (h * s).roundToInt().toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
-        val gray = Mat()
-        Imgproc.cvtColor(small, gray, Imgproc.COLOR_RGB2GRAY)
-        small.release()
-        Imgproc.GaussianBlur(gray, gray, Size(0.0, 0.0), 3.0)
-        val sh = gray.rows()
-        val sw = gray.cols()
-        if (!force && sw < sh * 1.05) {
-            gray.release(); return null
-        }
-        val g = ByteArray(sh * sw)
-        gray.get(0, 0, g)
-        gray.release()
-        fun px(y: Int, x: Int) = (g[y * sw + x].toInt() and 0xFF).toDouble()
-
-        val x0 = (sw * 0.30).toInt()
-        val x1 = (sw * 0.70).toInt()
-        val y0 = (sh * 0.15).toInt()
-        val y1 = (sh * 0.85).toInt()
-        val prof = DoubleArray(x1 - x0) { i ->
-            var sum = 0.0
-            for (y in y0 until y1) sum += px(y, x0 + i)
-            sum / (y1 - y0)
-        }
-        val sm = gaussian1d(prof, 2.0)
-        val xv = sm.indices.minByOrNull { sm[it] } ?: return null
-        val side = sm.filterIndexed { i, _ -> i < max(1, xv - 15) || i >= xv + 15 }.toDoubleArray()
-        val med = median(side)
-        val depth = (med - sm[xv]) / max(med, 1.0)
-        if (!force && depth < 0.06) return null
-
-        // 행 띠마다 골짜기 위치를 찾아 직선 근사 (기울어진 책 대응)
-        val xc = x0 + xv
-        val bx0 = max(0, xc - 40)
-        val bx1 = min(sw, xc + 40)
-        val ys = ArrayList<Double>()
-        val xs = ArrayList<Double>()
-        val step = max(4, (y1 - y0) / 30)
-        var yy = y0
-        while (yy < y1) {
-            var best = Double.MAX_VALUE
-            var bestX = bx0
-            for (x in bx0 until bx1) {
-                var sum = 0.0
-                var cnt = 0
-                for (r in yy until min(sh, yy + 8)) {
-                    sum += px(r, x); cnt++
-                }
-                val v = sum / max(cnt, 1)
-                if (v < best) {
-                    best = v; bestX = x
-                }
-            }
-            ys.add(yy + 4.0)
-            xs.add(bestX.toDouble())
-            yy += step
-        }
-        var (a, b) = polyfit1(ys, xs) ?: return null
-        val resid = ys.indices.map { kotlin.math.abs(xs[it] - (a * ys[it] + b)) }
-        val thr = max(3.0, percentile(resid.toDoubleArray(), 70.0))
-        val keep = ys.indices.filter { resid[it] < thr }
-        if (keep.size >= 2) {
-            polyfit1(keep.map { ys[it] }, keep.map { xs[it] })?.let { a = it.first; b = it.second }
-        }
-        return Pair(a, b / s)
-    }
 
     /** 접힌 선 기준 좌/우 페이지. 반대쪽은 배경색으로 가린다. */
     private fun splitSpread(img: Mat, gutter: Pair<Double, Double>): List<Mat> {
@@ -395,10 +330,59 @@ class BookScanEngine(modelBytes: ByteArray) : AutoCloseable {
         }
         val limH = (sh * maxFrac).toInt()
         val limW = (sw * maxFrac).toInt()
-        val t = scan(limH) { rowMed(it) }
-        val bt = scan(limH) { rowMed(sh - 1 - it) }
-        val l = scan(limW) { colMed(it) }
-        val r = scan(limW) { colMed(sw - 1 - it) }
+        var t = scan(limH) { rowMed(it) }
+        var bt = scan(limH) { rowMed(sh - 1 - it) }
+        var l = scan(limW) { colMed(it) }
+        var r = scan(limW) { colMed(sw - 1 - it) }
+
+        // 무늬 띠(바닥 카펫, 책 옆면의 종이 단면 줄무늬): 바깥에서 안쪽으로 훑다가 빈 종이 여백이 시작되는 곳까지
+        val gM = Mat(sh, sw, CvType.CV_8UC1).also { it.put(0, 0, g) }
+        val gxM = Mat()
+        val gyM = Mat()
+        Imgproc.Sobel(gM, gxM, CvType.CV_32F, 1, 0, 3)
+        Imgproc.Sobel(gM, gyM, CvType.CV_32F, 0, 1, 3)
+        gM.release()
+        val gx = FloatArray(sh * sw).also { gxM.get(0, 0, it) }
+        val gy = FloatArray(sh * sw).also { gyM.get(0, 0, it) }
+        gxM.release(); gyM.release()
+        val busyB = ByteArray(sh * sw) { if (gx[it] * gx[it] + gy[it] * gy[it] > 1600f) 1 else 0 }
+        val busyM = Mat(sh, sw, CvType.CV_8UC1).also { it.put(0, 0, busyB) }
+        val k5 = Mat.ones(5, 5, CvType.CV_8UC1)
+        Imgproc.dilate(busyM, busyM, k5)
+        k5.release()
+        busyM.get(0, 0, busyB)
+        busyM.release()
+        val r0 = (sh * 0.1).toInt()
+        val r1 = (sh * 0.9).toInt()
+        val c0 = (sw * 0.1).toInt()
+        val c1 = (sw * 0.9).toInt()
+        val colb = DoubleArray(sw) { x ->
+            var cnt = 0
+            for (y in r0 until r1) if (busyB[y * sw + x].toInt() == 0) cnt++
+            cnt.toDouble() / max(1, r1 - r0)
+        }
+        val rowb = DoubleArray(sh) { y ->
+            var cnt = 0
+            for (x in c0 until c1) if (busyB[y * sw + x].toInt() == 0) cnt++
+            cnt.toDouble() / max(1, c1 - c0)
+        }
+        fun tex(v: (Int) -> Double, n: Int, limit: Int): Int {
+            for (i in 0 until min(limit, n - 3)) {
+                if (v(i) >= 0.8 && v(i + 1) >= 0.8 && v(i + 2) >= 0.8) {
+                    if (i == 0) return 0
+                    var sum = 0.0
+                    for (j in 0 until i) sum += v(j)
+                    return if (sum / i < 0.3) i else 0 // 잘라낼 띠가 '무늬'일 때만
+                }
+            }
+            return 0
+        }
+        val limH2 = (sh * 0.10).toInt()
+        val limW2 = (sw * 0.10).toInt()
+        t = max(t, tex({ rowb[it] }, sh, limH2))
+        bt = max(bt, tex({ rowb[sh - 1 - it] }, sh, limH2))
+        l = max(l, tex({ colb[it] }, sw, limW2))
+        r = max(r, tex({ colb[sw - 1 - it] }, sw, limW2))
         return Trim(rint(t / s), rint(bt / s), rint(l / s), rint(r / s))
     }
 
@@ -626,6 +610,11 @@ class BookScanEngine(modelBytes: ByteArray) : AutoCloseable {
             Imgproc.GaussianBlur(g, g, Size(0.0, 0.0), 0.8)
             val bw = Mat()
             Imgproc.adaptiveThreshold(g, bw, 255.0, Imgproc.ADAPTIVE_THRESH_GAUSSIAN_C, Imgproc.THRESH_BINARY, 31, 12.0)
+            // 뒷면 비침(종이보다 조금만 어두운 흐린 글씨)은 검게 찍지 않음
+            val ghost = Mat()
+            Imgproc.threshold(g, ghost, BW_GHOST - 1.0, 255.0, Imgproc.THRESH_BINARY)
+            bw.setTo(Scalar(255.0), ghost)
+            ghost.release()
             g.release()
             return bw
         }
@@ -638,10 +627,10 @@ class BookScanEngine(modelBytes: ByteArray) : AutoCloseable {
         small.get(0, 0, sb)
         small.release()
         val lo = percentileByHistogram(sb, 1.0)
-        val hi = 238.0
+        val hi = WHITE_POINT // 흰색 기준을 낮춰 뒷면 비침(밝기 200~235)도 지움
         val lutBytes = ByteArray(256) { v ->
             val t = ((v - lo) / max(hi - lo, 1.0)).coerceIn(0.0, 1.0)
-            (t.pow(1.25) * 255.0).roundToInt().coerceIn(0, 255).toByte()
+            (t.pow(TONE_GAMMA) * 255.0).roundToInt().coerceIn(0, 255).toByte() // 감마>1: 옅은 글씨를 진하게
         }
         val lut = Mat(1, 256, CvType.CV_8UC1)
         lut.put(0, 0, lutBytes)
@@ -655,6 +644,58 @@ class BookScanEngine(modelBytes: ByteArray) : AutoCloseable {
         Core.addWeighted(y, 1.6, blur, -0.6, 0.0, out)
         y.release(); blur.release()
         return out
+    }
+
+    /**
+     * 가장자리 띠(각 변의 3%) 안의 긴 세로선·가로선(페이지 경계선, 접힌 선 그림자, 책 옆면 줄무늬 찌꺼기)을 흰색으로.
+     * 글자는 짧은 획들이라 긴 선 모양 걸러내기(열림 연산)를 통과하지 못한다. out 을 직접 수정.
+     */
+    private fun cleanEdges(out: Mat) {
+        val h = out.rows()
+        val w = out.cols()
+        val gray = Mat()
+        if (out.channels() == 3) Imgproc.cvtColor(out, gray, Imgproc.COLOR_RGB2GRAY) else out.copyTo(gray)
+        val s = min(1.0, 1200.0 / max(h, w))
+        val g = Mat()
+        if (s < 1.0) Imgproc.resize(gray, g, Size(rint(w * s).toDouble(), rint(h * s).toDouble()), 0.0, 0.0, Imgproc.INTER_AREA) else gray.copyTo(g)
+        gray.release()
+        val sh = g.rows()
+        val sw = g.cols()
+        val dark = Mat()
+        Imgproc.threshold(g, dark, 199.0, 255.0, Imgproc.THRESH_BINARY_INV) // g < 200
+        g.release()
+        val kv = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(1.0, max(5, (sh * 0.04).toInt()).toDouble()))
+        val kh = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(max(5, (sw * 0.04).toInt()).toDouble(), 1.0))
+        val vert = Mat()
+        val horz = Mat()
+        Imgproc.morphologyEx(dark, vert, Imgproc.MORPH_OPEN, kv)
+        Imgproc.morphologyEx(dark, horz, Imgproc.MORPH_OPEN, kh)
+        dark.release(); kv.release(); kh.release()
+        val vb = ByteArray(sh * sw).also { vert.get(0, 0, it) }
+        val hb = ByteArray(sh * sw).also { horz.get(0, 0, it) }
+        vert.release(); horz.release()
+        val bx = max(2, (sw * 0.03).toInt())
+        val by = max(2, (sh * 0.03).toInt())
+        val mb = ByteArray(sh * sw)
+        var any = false
+        for (y in 0 until sh) for (x in 0 until sw) {
+            val k = y * sw + x
+            val inX = x < bx || x >= sw - bx
+            val inY = y < by || y >= sh - by
+            if ((inX && vb[k].toInt() != 0) || (inY && hb[k].toInt() != 0)) {
+                mb[k] = 255.toByte(); any = true
+            }
+        }
+        if (!any) return
+        val m = Mat(sh, sw, CvType.CV_8UC1).also { it.put(0, 0, mb) }
+        val k5 = Mat.ones(5, 5, CvType.CV_8UC1)
+        Imgproc.dilate(m, m, k5)
+        k5.release()
+        val full = Mat()
+        if (s < 1.0) Imgproc.resize(m, full, Size(w.toDouble(), h.toDouble()), 0.0, 0.0, Imgproc.INTER_LINEAR) else m.copyTo(full)
+        m.release()
+        out.setTo(Scalar.all(255.0), full)
+        full.release()
     }
 
     /** 손가락 영역을 흰색으로 채우고(경계는 부드럽게), 주변의 옅은 그림자·테두리도 정리. out 을 직접 수정. */
@@ -751,8 +792,17 @@ class BookScanEngine(modelBytes: ByteArray) : AutoCloseable {
         const val GRID_W = 31
         const val GRID_H = 45
 
-        /** 처리 해상도 상한(긴 변). 책 한 페이지 기준 300dpi 이상 */
-        const val MAX_SIDE = 3000
+        /** 처리 해상도 상한(긴 변). 카메라 원본(4000x3000)을 그대로 써서 양면을 나눠도 글씨가 또렷하게 */
+        const val MAX_SIDE = 4000
+
+        /** 이보다 밝으면 흰 종이로(뒷면 비침 제거) */
+        const val WHITE_POINT = 220.0
+
+        /** 1보다 크면 중간 밝기(옅은 글씨)를 진하게 */
+        const val TONE_GAMMA = 2.0
+
+        /** 흑백 모드에서 이보다 밝은 것은 글자로 보지 않음 */
+        const val BW_GHOST = 185.0
 
         /** 글줄 분석 해상도(긴 변) */
         const val ANALYSIS_SIDE = 1600.0

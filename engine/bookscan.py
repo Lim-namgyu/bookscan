@@ -13,6 +13,7 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 
+from orient import detect_rotation, rotate_image
 from straighten import straighten_maps
 
 MODEL_W, MODEL_H = 488, 712  # UVDoc 입력 크기 (가로, 세로)
@@ -26,38 +27,114 @@ class Page:
 
 
 # ====================================================================== 1. 양면 분리
+def _text_mask_small(gray):
+    """글자 픽셀(True). 그림·상자 테두리 같은 큰 덩어리는 제외"""
+    sh, sw = gray.shape
+    block = max(15, int(min(sh, sw) * 0.03)) | 1
+    m = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, block, 12)
+    n, lbl, st, _ = cv2.connectedComponentsWithStats(m, 8)
+    hs, ws = st[:, cv2.CC_STAT_HEIGHT], st[:, cv2.CC_STAT_WIDTH]
+    keep = (hs < sh * 0.04) & (ws < sw * 0.04) & (st[:, cv2.CC_STAT_AREA] >= 3)
+    keep[0] = False
+    return keep[lbl]
+
+
+def _clearance_1d(occ, cap):
+    """빈 열에서 가장 가까운 글자 열까지 거리(최대 cap). 글자 열은 0"""
+    n = len(occ)
+    d = np.full(n, 1e9)
+    last = -1e9
+    for x in range(n):
+        if occ[x]:
+            last = x
+        d[x] = x - last
+    last = 1e9
+    for x in range(n - 1, -1, -1):
+        if occ[x]:
+            last = x
+        d[x] = min(d[x], last - x)
+    return np.minimum(d, cap)
+
+
 def find_gutter(img, force=False):
-    """양면 펼침이면 가운데 접힌 선을 x = a*y + b 직선으로 반환, 아니면 None."""
+    """
+    양면 펼침이면 가운데 접힌 선을 x = a*y + b 직선(원본 좌표)으로 반환, 아니면 None.
+    접힌 선 = 두 페이지 글 사이의 '글 없는 세로 띠'를 위에서 아래까지 가장 여유 있게 지나는 직선.
+    (밝기만 보면 조명 때문에 한쪽 페이지가 통째로 어두울 때 엉뚱한 곳을 잡음)
+    """
     h, w = img.shape[:2]
-    s = 600.0 / w
+    s = 800.0 / max(h, w)
     small = cv2.resize(img, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
-    gray = cv2.GaussianBlur(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY), (0, 0), 3).astype(np.float32)
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
     sh, sw = gray.shape
     if not force and sw < sh * 1.05:  # 세로로 긴 사진은 한 페이지로 본다
         return None
+    txt = _text_mask_small(gray)
+    cx = (sw - 1) / 2.0
+    nb = 14
+    ys = np.linspace(sh * 0.06, sh * 0.94, nb + 1).astype(int)
+    yc = (ys[:-1] + ys[1:]) / 2.0
+    cap = max(3.0, sw * 0.03)
+    lo = int(max(0, cx - sw * 0.22))
+    hi = int(min(sw - 1, cx + sw * 0.22))
+    clear = np.zeros((nb, sw), np.float64)
+    informative = 0
+    for k in range(nb):
+        dens = txt[ys[k]:ys[k + 1], :].sum(axis=0)
+        occ = np.convolve(dens, np.ones(3), mode="same") > 0
+        clear[k] = _clearance_1d(occ, cap)
+        if clear[k][lo:hi + 1].max() > 0 and occ[lo:hi + 1].any():
+            informative += 1  # 글과 빈 칸이 다 있는 띠만 판단에 씀(바닥·그림만 있는 띠 제외)
+    xs = np.arange(lo, hi + 1)
+    span = yc[-1] - yc[0]
+    max_dx = np.tan(np.radians(15)) * span
+    XT, XB = np.meshgrid(xs, xs, indexing="ij")
+    score = np.zeros(XT.shape)
+    hits = np.zeros(XT.shape, np.int32)
+    for k in range(nb):
+        t = (yc[k] - yc[0]) / span
+        xk = np.clip(np.round(XT + (XB - XT) * t).astype(int), 0, sw - 1)
+        ck = clear[k][xk]
+        score += ck
+        hits += ck > 0
+    xm_all = (XT + XB) / 2.0
+    score -= 0.5 * cap * np.abs(xm_all - cx) / sw * nb  # 같은 점수면 가운데 쪽
+    score[np.abs(XB - XT) > max_dx] = -1e18
+    i, j = np.unravel_index(int(np.argmax(score)), score.shape)
+    xt, xb = float(xs[i]), float(xs[j])
+    a = (xb - xt) / span
+    b = xt - a * yc[0]
+    xm = (xt + xb) / 2.0
+    if not force:
+        frac = hits[i, j] / max(1, informative)
+        left_txt = txt[:, :max(1, int(xm))].sum()
+        right_txt = txt[:, int(xm):].sum()
+        balance = min(left_txt, right_txt) / max(1, max(left_txt, right_txt))
+        if informative < 6 or frac < 0.7 or abs(xm - cx) > sw * 0.15 or balance < 0.25:
+            return None
+        # 진짜 접힌 선에는 종이가 꺾이며 생기는 옅은 그림자 골짜기가 있다(표의 칸 사이 빈 줄과 구분)
+        if _fold_shadow(gray, a, b) < 0.012:
+            return None
+    return a, b / s
 
-    x0, x1 = int(sw * 0.30), int(sw * 0.70)
-    y0, y1 = int(sh * 0.15), int(sh * 0.85)
-    prof = gray[y0:y1, x0:x1].mean(axis=0)
-    prof = cv2.GaussianBlur(prof.reshape(1, -1), (0, 0), 2).ravel()
-    xv = int(np.argmin(prof))
-    side = np.concatenate([prof[: max(1, xv - 15)], prof[xv + 15:]])
-    depth = (np.median(side) - prof[xv]) / max(np.median(side), 1)
-    if not force and depth < 0.06:  # 접힌 선 그림자가 약하면 한 페이지
-        return None
 
-    # 행 띠마다 골짜기 위치를 찾아 직선 근사 (기울어진 책 대응)
-    xc = x0 + xv
-    pts = []
-    for yy in range(y0, y1, max(4, (y1 - y0) // 30)):
-        band = gray[yy:yy + 8, max(0, xc - 40):min(sw, xc + 40)].mean(axis=0)
-        pts.append((yy + 4, max(0, xc - 40) + int(np.argmin(band))))
-    pts = np.array(pts, np.float32)
-    a, b = np.polyfit(pts[:, 0], pts[:, 1], 1)
-    resid = np.abs(pts[:, 1] - (a * pts[:, 0] + b))
-    keep = resid < max(3.0, np.percentile(resid, 70))
-    a, b = np.polyfit(pts[keep, 0], pts[keep, 1], 1)
-    return a, b / s  # 원본 좌표계 (기울기는 비율이라 그대로)
+def _fold_shadow(gray, a, b):
+    """직선 x = a*y + b (작은 이미지 좌표) 를 따라 잰 그림자 골짜기 깊이(중앙값, 종이 밝기 대비 비율)"""
+    sh, sw = gray.shape
+    k = max(7, int(sw * 0.025)) | 1
+    paper = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))).astype(np.float32)
+    W = max(6, int(sw * 0.05))
+    rels = []
+    for yy in np.linspace(sh * 0.1, sh * 0.9, 12):
+        y0 = int(yy)
+        band = np.median(paper[max(0, y0 - 8):y0 + 8], axis=0)
+        xl = int(np.round(a * yy + b))
+        if xl - W < 0 or xl + W >= sw:
+            continue
+        c = band[xl - 3:xl + 4].min()
+        side = min(band[xl - W:xl - 3].max(), band[xl + 4:xl + W].max())
+        rels.append((side - c) / max(side, 1.0))
+    return float(np.median(rels)) if rels else 0.0
 
 
 def split_spread(img, gutter):
@@ -167,11 +244,17 @@ def extend_grid_v(g, n):
 
 
 def trim_rect(img, max_frac=0.06):
-    """가장자리에 남은 책상·책 옆면의 어두운 띠 두께 (위, 아래, 왼쪽, 오른쪽)"""
+    """
+    가장자리에서 잘라낼 두께 (위, 아래, 왼쪽, 오른쪽).
+      1) 어두운 띠(책상, 그림자)
+      2) 무늬 띠(바닥 카펫, 책 옆면의 종이 단면 줄무늬): 바깥에서 안쪽으로 훑다가
+         빈 종이 여백이 시작되는 곳까지. 글·그림이 있는 곳은 자르지 않음.
+    """
     gray = img if img.ndim == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
     s = min(1.0, 1000.0 / max(h, w))
-    g = cv2.resize(gray, (int(round(w * s)), int(round(h * s))), interpolation=cv2.INTER_AREA).astype(np.float32)
+    g8 = cv2.resize(gray, (int(round(w * s)), int(round(h * s))), interpolation=cv2.INTER_AREA)
+    g = g8.astype(np.float32)
     sh, sw = g.shape
     thr = np.percentile(g, 70) * 0.72
 
@@ -188,6 +271,28 @@ def trim_rect(img, max_frac=0.06):
     bt = scan(g[::-1], int(sh * max_frac))
     l = scan(g.T, int(sw * max_frac))
     r = scan(g.T[::-1], int(sw * max_frac))
+
+    # 무늬 띠
+    gx = cv2.Sobel(g8, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(g8, cv2.CV_32F, 0, 1, ksize=3)
+    busy = cv2.dilate((gx * gx + gy * gy > 40.0 * 40.0).astype(np.uint8), np.ones((5, 5), np.uint8))
+    blank = 1.0 - busy.astype(np.float32)
+    colb = blank[int(sh * 0.1):int(sh * 0.9)].mean(axis=0)
+    rowb = blank[:, int(sw * 0.1):int(sw * 0.9)].mean(axis=1)
+
+    def tex(vals, limit):
+        for i in range(min(limit, len(vals) - 3)):
+            if vals[i] >= 0.8 and vals[i + 1] >= 0.8 and vals[i + 2] >= 0.8:
+                if i == 0 or vals[:i].mean() < 0.3:  # 잘라낼 띠가 '무늬'일 때만
+                    return i
+                return 0
+        return 0
+
+    lim_h, lim_w = int(sh * 0.10), int(sw * 0.10)
+    t = max(t, tex(rowb, lim_h))
+    bt = max(bt, tex(rowb[::-1], lim_h))
+    l = max(l, tex(colb, lim_w))
+    r = max(r, tex(colb[::-1], lim_w))
     return int(round(t / s)), int(round(bt / s)), int(round(l / s)), int(round(r / s))
 
 
@@ -314,23 +419,61 @@ def flatten_illumination(img):
     return np.clip(out, 0, 255)
 
 
+WHITE_POINT = 220.0  # 이보다 밝으면 흰 종이로(뒷면 비침 제거)
+TONE_GAMMA = 2.0     # 1보다 크면 중간 밝기(옅은 글씨)를 진하게
+BW_GHOST = 185       # 흑백 모드에서 이보다 밝은 것은 글자로 보지 않음
+
+
 def finish(norm, mode="color"):
     """norm: 조명 평탄화된 float 이미지. mode: color / gray / bw"""
     if mode == "bw":
         g = cv2.cvtColor(norm.astype(np.uint8), cv2.COLOR_BGR2GRAY)
         g = cv2.GaussianBlur(g, (0, 0), 0.8)
         bw = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 12)
+        # 뒷면 비침(종이보다 조금만 어두운 흐린 글씨)은 검게 찍지 않음
+        bw[g >= BW_GHOST] = 255
         return bw
     x = norm if mode == "color" else cv2.cvtColor(norm.astype(np.uint8), cv2.COLOR_BGR2GRAY).astype(np.float32)
-    # 레벨: 종이(상위)는 완전 흰색, 글자는 더 진하게
+    # 레벨: 종이(상위)는 완전 흰색, 글자는 더 진하게. 흰색 기준을 낮춰 뒷면 비침(밝기 200~235)도 지움
     lo = np.percentile(x, 1.0)
-    hi = 238.0
+    hi = WHITE_POINT
     x = np.clip((x - lo) / (hi - lo), 0, 1)
-    x = x ** 1.25 * 255.0
+    x = x ** TONE_GAMMA * 255.0
     # 언샤프 마스크
     blur = cv2.GaussianBlur(x, (0, 0), 1.2)
     x = cv2.addWeighted(x, 1.6, blur, -0.6, 0)
     return np.clip(x, 0, 255).astype(np.uint8)
+
+
+def clean_edges(out):
+    """
+    가장자리 띠(각 변의 3%) 안에 있는 긴 세로선·가로선(페이지 경계선, 접힌 선 그림자, 책 옆면 줄무늬 찌꺼기)을 흰색으로.
+    글자는 짧은 획들이라 긴 선 모양 걸러내기(열림 연산)를 통과하지 못한다.
+    """
+    gray = out if out.ndim == 2 else cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape
+    s = min(1.0, 1200.0 / max(h, w))
+    g = cv2.resize(gray, (int(round(w * s)), int(round(h * s))), interpolation=cv2.INTER_AREA) if s < 1 else gray
+    sh, sw = g.shape
+    dark = (g < 200).astype(np.uint8) * 255
+    bx, by = max(2, int(sw * 0.03)), max(2, int(sh * 0.03))
+    kv = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(5, int(sh * 0.04))))
+    kh = cv2.getStructuringElement(cv2.MORPH_RECT, (max(5, int(sw * 0.04)), 1))
+    vert = cv2.morphologyEx(dark, cv2.MORPH_OPEN, kv)
+    horz = cv2.morphologyEx(dark, cv2.MORPH_OPEN, kh)
+    m = np.zeros_like(dark)
+    m[:, :bx] |= vert[:, :bx]
+    m[:, sw - bx:] |= vert[:, sw - bx:]
+    m[:by, :] |= horz[:by, :]
+    m[sh - by:, :] |= horz[sh - by:, :]
+    if not m.any():
+        return out
+    m = cv2.dilate(m, np.ones((5, 5), np.uint8))
+    if s < 1:
+        m = cv2.resize(m, (w, h), interpolation=cv2.INTER_LINEAR)
+    res = out.copy()
+    res[m > 0] = 255
+    return res
 
 
 def erase(out, mask):
@@ -359,6 +502,10 @@ class BookScanner:
 
     def process(self, img, layout="auto", mode="color"):
         """layout: auto / single / double"""
+        # 폰을 세로로 든 채 펼친 책을 찍으면 글이 옆으로 누워 있음 → 글이 바로 서도록 먼저 돌림
+        rot = detect_rotation(img)
+        if rot:
+            img = rotate_image(img, rot)
         gutter = None
         if layout != "single":
             gutter = find_gutter(img, force=(layout == "double"))
@@ -370,7 +517,7 @@ class BookScanner:
             skip = None if len(parts) == 1 else ("right" if idx == 0 else "left")
             m = finger_mask(flat, skip)
             out = finish(flatten_illumination(fill_paper(flat, m)), mode)
-            pages.append(Page(erase(out, m), flat, m))
+            pages.append(Page(clean_edges(erase(out, m)), flat, m))
         return pages
 
 
