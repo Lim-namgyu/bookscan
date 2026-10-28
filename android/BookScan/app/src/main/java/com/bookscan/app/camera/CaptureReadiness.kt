@@ -7,6 +7,7 @@ import com.bookscan.app.engine.BookRegion
 import org.opencv.core.CvType
 import org.opencv.core.Mat
 import org.opencv.imgproc.Imgproc
+import java.util.concurrent.Executors
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -32,7 +33,10 @@ class CaptureReadiness(private val regionLoader: () -> BookRegion?) : ImageAnaly
      * ready: 지금 찍어도 좋음. issue: 가장 먼저 고칠 것. box: 책 영역(화면을 바로 세운 기준, 0~1 비율), 없으면 null.
      * focusStuck: 멈춰 있는데도 초점이 오래 안 맞음(탭해서 초점 맞추기를 안내).
      */
-    class Status(val ready: Boolean, val issue: Issue, val box: RectF?, val focusStuck: Boolean)
+    class Status(val ready: Boolean, val issue: Issue, val box: RectF?, val focusStuck: Boolean, val aspect: Float)
+
+    /** 책 영역 판단 결과(한 번에 바꿔치기해 세 값이 어긋나지 않게) */
+    private class Det(val issue: Issue, val box: RectF?, val boxPx: IntArray?)
 
     /** 폰 기울기(도). 0 = 책(바닥)과 평행. 센서에서 넣어준다 */
     @Volatile var tiltDeg: Float = 0f
@@ -49,15 +53,17 @@ class CaptureReadiness(private val regionLoader: () -> BookRegion?) : ImageAnaly
     private var regionTried = false
 
     // 움직임 판단용 작은 밝기 격자
-    private var prev: FloatArray? = null
+    @Volatile private var prev: FloatArray? = null
     @Volatile private var lastShot: FloatArray? = null
-    private var cooldownUntil = 0L
+    @Volatile private var cooldownUntil = 0L
+    private var prevAt = 0L
+    private var lastMotion = 100f
 
-    // 책 영역 판단(모델)은 비싸서 간격을 두고 돌리고, 그 사이에는 마지막 결과를 쓴다
-    private var lastDetectAt = 0L
-    private var detIssue: Issue = Issue.NO_BOOK
-    private var detBox: RectF? = null            // 프레임 좌표(0~1), 회전 전
-    private var detBoxPx: IntArray? = null       // 프레임 픽셀 좌표 x0, y0, x1, y1
+    // 책 영역 판단(모델)은 비싸서 별도 스레드에서 간격을 두고 돌리고, 그 사이에는 마지막 결과를 쓴다
+    private val detectExecutor = Executors.newSingleThreadExecutor()
+    @Volatile private var detBusy = false
+    @Volatile private var lastDetectAt = 0L
+    @Volatile private var det = Det(Issue.NO_BOOK, null, null)
 
     private var readyStreak = 0
     private var stillSince = 0L
@@ -89,21 +95,36 @@ class CaptureReadiness(private val regionLoader: () -> BookRegion?) : ImageAnaly
             for (i in cur.indices) cur[i] /= mean
             val p = prev
             prev = cur
-            val motion = if (p == null) 100f else diff(cur, p)
+            val gap = now - prevAt
+            prevAt = now
+            // 프레임 사이가 길게 비었으면(다른 작업에 밀림) 그 차이는 손 움직임이 아니므로 직전 값을 유지
+            val motion = if (p == null) 100f else if (gap > 200) lastMotion else diff(cur, p)
+            lastMotion = motion
 
-            // ---- 책 영역 (간격을 두고)
-            if (now - lastDetectAt >= DETECT_MS) {
-                lastDetectAt = now
-                detect(buf, w, h, rowStride, pixStride)
+            // ---- 책 영역: 프레임에서 작은 RGB 를 뽑아 별도 스레드에 넘김 (모델 추론이 프리뷰 분석을 막지 않게)
+            if (!detBusy && now - lastDetectAt >= DETECT_MS) {
+                val rot = image.imageInfo.rotationDegrees
+                val sample = sampleRgb(buf, w, h, rowStride, pixStride)
+                detBusy = true
+                detectExecutor.execute {
+                    try {
+                        det = detect(sample)
+                    } catch (_: Throwable) {
+                    } finally {
+                        lastDetectAt = System.currentTimeMillis()
+                        detBusy = false
+                    }
+                }
             }
+            val d = det
 
             // ---- 밝기·또렷함: 책 영역 안(없으면 가운데 80%)에서, 가로 2픽셀 간격으로 샘플
-            val bx = detBoxPx ?: intArrayOf((w * 0.1).toInt(), (h * 0.1).toInt(), (w * 0.9).toInt(), (h * 0.9).toInt())
+            val bx = d.boxPx ?: intArrayOf((w * 0.1).toInt(), (h * 0.1).toInt(), (w * 0.9).toInt(), (h * 0.9).toInt())
             val (bright, clipped, sharp) = measure(buf, rowStride, pixStride, bx)
 
             // ---- 판단 (먼저 고쳐야 할 것부터)
             val issue = when {
-                detIssue != Issue.NONE -> detIssue
+                d.issue != Issue.NONE -> d.issue
                 tiltDeg > TILT_MAX -> Issue.TILTED
                 bright < DARK_T -> Issue.DARK
                 clipped > CLIP_T -> Issue.BRIGHT
@@ -116,8 +137,10 @@ class CaptureReadiness(private val regionLoader: () -> BookRegion?) : ImageAnaly
             val ready = issue == Issue.NONE
             readyStreak = if (ready) readyStreak + 1 else 0
 
-            val box = detBox?.let { upright(it, image.imageInfo.rotationDegrees) }
-            val st = Status(ready, issue, box, focusStuck)
+            val rotation = image.imageInfo.rotationDegrees
+            val box = d.box?.let { upright(it, rotation) }
+            val aspect = if (rotation % 180 == 0) w.toFloat() / h else h.toFloat() / w
+            val st = Status(ready, issue, box, focusStuck, aspect)
             val prevSt = lastStatus
             if (prevSt == null || prevSt.ready != st.ready || prevSt.issue != st.issue || prevSt.focusStuck != st.focusStuck ||
                 boxMoved(prevSt.box, st.box)
@@ -149,24 +172,22 @@ class CaptureReadiness(private val regionLoader: () -> BookRegion?) : ImageAnaly
         cooldownUntil = System.currentTimeMillis() + COOLDOWN_MS
     }
 
+    /** 카메라 해제 후, 분석 스레드에서 호출 */
     fun close() {
-        region?.close()
-        region = null
+        detectExecutor.execute {
+            runCatching { region?.close() }
+            region = null
+            regionTried = false
+        }
+        detectExecutor.shutdown()
     }
 
     // ------------------------------------------------------------------ 책 영역
 
-    private fun detect(buf: java.nio.ByteBuffer, w: Int, h: Int, rowStride: Int, pixStride: Int) {
-        if (!regionTried) {
-            regionTried = true
-            region = runCatching { regionLoader() }.getOrNull()
-        }
-        val reg = region
-        if (reg == null) { // 모델이 없으면 책 위치는 판단하지 않음
-            detIssue = Issue.NONE; detBox = null; detBoxPx = null
-            return
-        }
-        // RGBA 프레임 → RGB Mat (긴 변 DET_SIDE 로 줄여서)
+    private class Sample(val rgb: ByteArray, val dw: Int, val dh: Int, val w: Int, val h: Int, val s: Double)
+
+    /** RGBA 프레임 → 작은 RGB (긴 변 DET_SIDE). 분석 스레드에서 몇 ms */
+    private fun sampleRgb(buf: java.nio.ByteBuffer, w: Int, h: Int, rowStride: Int, pixStride: Int): Sample {
         val s = min(1.0, DET_SIDE / max(w, h))
         val dw = max(16, (w * s).toInt())
         val dh = max(16, (h * s).toInt())
@@ -181,17 +202,31 @@ class CaptureReadiness(private val regionLoader: () -> BookRegion?) : ImageAnaly
                 k += 3
             }
         }
-        val m = Mat(dh, dw, CvType.CV_8UC3).also { it.put(0, 0, rgb) }
+        return Sample(rgb, dw, dh, w, h, s)
+    }
+
+    /** 책 영역 판단 (별도 스레드) */
+    private fun detect(sm: Sample): Det {
+        if (!regionTried) {
+            regionTried = true
+            region = runCatching { regionLoader() }.getOrNull()
+        }
+        val reg = region ?: return Det(Issue.NONE, null, null) // 모델이 없으면 책 위치는 판단하지 않음
+        val dw = sm.dw
+        val dh = sm.dh
+        val w = sm.w
+        val h = sm.h
+        val s = sm.s
+        val m = Mat(dh, dw, CvType.CV_8UC3).also { it.put(0, 0, sm.rgb) }
         val res = reg.mask(m)
         m.release()
         if (res == null) {
-            detIssue = when (reg.lastReason) {
+            val issue = when (reg.lastReason) {
                 BookRegion.REASON_FILLS -> Issue.CUT_OFF
                 BookRegion.REASON_SMALL -> Issue.TOO_SMALL
                 else -> Issue.NO_BOOK
             }
-            detBox = null; detBoxPx = null
-            return
+            return Det(issue, null, null)
         }
         val (mask, box) = res
         val mb = ByteArray(dw * dh).also { mask.get(0, 0, it) }
@@ -215,17 +250,18 @@ class CaptureReadiness(private val regionLoader: () -> BookRegion?) : ImageAnaly
         val areaFrac = area.toFloat() / (dw * dh)
         val cx = (box.x + box.width / 2f) / dw
         val cy = (box.y + box.height / 2f) / dh
-        detBox = RectF(box.x.toFloat() / dw, box.y.toFloat() / dh, (box.x + box.width).toFloat() / dw, (box.y + box.height).toFloat() / dh)
-        detBoxPx = intArrayOf(
+        val rect = RectF(box.x.toFloat() / dw, box.y.toFloat() / dh, (box.x + box.width).toFloat() / dw, (box.y + box.height).toFloat() / dh)
+        val px = intArrayOf(
             (box.x / s).toInt().coerceIn(0, w - 1), (box.y / s).toInt().coerceIn(0, h - 1),
             ((box.x + box.width) / s).toInt().coerceIn(1, w), ((box.y + box.height) / s).toInt().coerceIn(1, h)
         )
-        detIssue = when {
+        val issue = when {
             touch > TOUCH_T -> Issue.CUT_OFF
             areaFrac < AREA_MIN -> Issue.TOO_SMALL
             abs(cx - 0.5f) > CENTER_T || abs(cy - 0.5f) > CENTER_T -> Issue.OFF_CENTER
             else -> Issue.NONE
         }
+        return Det(issue, rect, px)
     }
 
     // ------------------------------------------------------------------ 밝기·또렷함
@@ -306,10 +342,10 @@ class CaptureReadiness(private val regionLoader: () -> BookRegion?) : ImageAnaly
 
         // 아래 수치는 실제 기기에서 써보며 조정할 값
         const val STILL_T = 1.5f        // 직전 프레임과 평균 밝기 차(%) 가 이보다 작으면 '멈춤'
-        const val SHARP_T = 0.7f        // 또렷함 기준 (PC 시험: 또렷한 사진 1.1~5.7, 많이 흐린 사진 0.1~0.45)
+        const val SHARP_T = 0.32f       // 또렷함 기준 (PC 시험, 640px 프리뷰 기준: 또렷한 사진 0.45~1.2, 많이 흐린 사진 0.06~0.23)
         const val DARK_T = 85f          // 책 영역 평균 밝기(0~255)가 이보다 어두우면 '어두움' (어두우면 보정 후 잡음이 커짐)
         const val CLIP_T = 0.08f        // 밝기 250 이상(날아감) 비율이 이보다 크면 '너무 밝음'
-        const val TILT_MAX = 20f        // 폰 기울기(도)
+        const val TILT_MAX = 25f        // 폰 기울기(도). 책을 받침대에 비스듬히 놓고 찍으면 수동 촬영은 되지만 자동은 안 됨
         const val AREA_MIN = 0.22f      // 책이 화면에서 차지하는 비율 최소
         const val TOUCH_T = 0.25f       // 책이 화면 한 변에 이 비율 이상 닿아 있으면 '잘림'
         const val CENTER_T = 0.18f      // 책 중심이 화면 중심에서 이보다 벗어나면 '가운데로'

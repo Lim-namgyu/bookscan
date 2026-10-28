@@ -158,8 +158,10 @@ private fun CameraContent(vm: MainViewModel, onOpenReview: () -> Unit) {
     var flash by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf<CaptureReadiness.Status?>(null) }
 
+    // 화면을 떠난 뒤 늦게 도착한 자동 촬영 신호가 해제된 소리·카메라를 건드리지 않게
+    val alive = remember { java.util.concurrent.atomic.AtomicBoolean(true) }
     val capture: () -> Unit = {
-        if (!busy) {
+        if (alive.get() && !busy) {
             busy = true
             flash = true
             sound.play(MediaActionSound.SHUTTER_CLICK)
@@ -262,10 +264,12 @@ private fun CameraContent(vm: MainViewModel, onOpenReview: () -> Unit) {
         }
     }
 
-    DisposableEffect(lifecycleOwner) {
+    DisposableEffect(Unit) {
         val future = ProcessCameraProvider.getInstance(ctx)
         val analysisExecutor = Executors.newSingleThreadExecutor()
+        var disposed = false
         future.addListener({
+            if (disposed) return@addListener
             val provider = future.get()
             val ratio = ResolutionSelector.Builder()
                 .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
@@ -288,9 +292,13 @@ private fun CameraContent(vm: MainViewModel, onOpenReview: () -> Unit) {
             }
         }, mainExecutor)
         onDispose {
+            disposed = true
+            alive.set(false)
+            readiness.onTrigger = null
+            readiness.onStatus = null
             // 카메라를 먼저 해제한 뒤 실행기를 닫아야, 진행 중이던 촬영 콜백이 닫힌 실행기로 가지 않는다
             runCatching { future.get().unbindAll() }
-            analysisExecutor.execute { readiness.close() }
+            analysisExecutor.execute { runCatching { readiness.close() } }
             analysisExecutor.shutdown()
             captureExecutor.shutdown()
             sound.release()
@@ -317,8 +325,8 @@ private fun CameraContent(vm: MainViewModel, onOpenReview: () -> Unit) {
         if (st?.box != null) {
             val box = st.box
             Canvas(Modifier.fillMaxSize()) {
-                // 프리뷰(FIT_CENTER, 세로 화면에서 3:4)가 실제로 그려진 영역
-                val aspect = 3f / 4f
+                // 프리뷰(FIT_CENTER)가 실제로 그려진 영역: 바로 세운 프레임의 가로/세로 비율
+                val aspect = st.aspect
                 val cw = minOf(size.width, size.height * aspect)
                 val ch = cw / aspect
                 val ox = (size.width - cw) / 2f
