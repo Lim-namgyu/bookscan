@@ -97,19 +97,53 @@ def detect_lines(gray, min_frac=0.12):
     return out, ch
 
 
+def _centers_of(sub, x, y, bw, bh, step):
+    """부분 마스크(sub)의 열 묶음마다 세로 중심 → (xs, ys)"""
+    yy = np.arange(bh, dtype=np.float32)[:, None]
+    xs, ys = [], []
+    for c0 in range(0, bw, step):
+        blk = sub[:, c0:c0 + step]
+        cnt = blk.sum()
+        if cnt < 1:
+            continue
+        xs.append(x + c0 + blk.shape[1] / 2.0)
+        ys.append(y + float((blk * yy).sum() / cnt))
+    return np.array(xs), np.array(ys)
+
+
 def detect_rules(gray, ch, min_frac=0.25):
     """
-    가로 괘선(밑줄·표 테두리·꼬리말 선)의 중심선. 긴 직선이라 글줄보다 더 믿을 만한 기준이 된다.
+    가로 괘선(밑줄·표 테두리·꼬리말 선·머리글 장식선)의 중심선. 긴 직선이라 글줄보다 더 믿을 만한 기준이 된다.
+      1) 가늘고 긴 덩어리: 휘어 있어도(페이지 모서리의 곡면 잔재) 그대로 따라감
+      2) 열림 연산으로 남는 곧은 선: 글자와 붙은 밑줄처럼 덩어리로는 두꺼워 보이는 경우
     반환: [(xs, ys)]
     """
     mask = text_mask(gray)
     h, w = mask.shape
-    # 가로로 긴 구조만 남기기
+    step = max(2, int(ch))
+    out = []
+    boxes = []
+    # 1) 가늘고 긴 덩어리
+    n, lbl, st, _ = cv2.connectedComponentsWithStats(mask, 8)
+    for i in range(1, n):
+        x, y, bw, bh, area = st[i]
+        if bw < w * min_frac or bh > bw * 0.2:
+            continue
+        if area / max(bw, 1) > ch * 0.6:
+            continue
+        sub = lbl[y:y + bh, x:x + bw] == i
+        # 열마다 두께가 얇아야(글자가 이어 붙은 줄은 제외)
+        thick = sub.sum(axis=0)
+        if np.median(thick[thick > 0]) > ch * 0.4:
+            continue
+        xs, ys = _centers_of(sub, x, y, bw, bh, step)
+        if len(xs) >= 6:
+            out.append((xs, ys))
+            boxes.append((x, y, bw, bh))
+    # 2) 곧은 선 (열림 연산)
     k = max(9, int(ch * 4)) | 1
     horiz = cv2.morphologyEx(mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (k, 1)))
     n, lbl, st, _ = cv2.connectedComponentsWithStats(horiz, 8)
-    out = []
-    step = max(2, int(ch))
     for i in range(1, n):
         x, y, bw, bh, area = st[i]
         if bw < w * min_frac:
@@ -117,18 +151,19 @@ def detect_rules(gray, ch, min_frac=0.25):
         thick = area / max(bw, 1)
         if thick > ch * 0.9 or bh > bw * 0.2:
             continue
+        # 1)에서 이미 잡은 선과 겹치면 건너뜀
+        dup = False
+        for (bx, by, bbw, bbh) in boxes:
+            ox = min(x + bw, bx + bbw) - max(x, bx)
+            if ox > 0.8 * bw and y + bh >= by - ch and y <= by + bbh + ch:
+                dup = True
+                break
+        if dup:
+            continue
         sub = lbl[y:y + bh, x:x + bw] == i
-        yy = np.arange(bh, dtype=np.float32)[:, None]
-        xs, ys = [], []
-        for c0 in range(0, bw, step):
-            blk = sub[:, c0:c0 + step]
-            cnt = blk.sum()
-            if cnt < 1:
-                continue
-            xs.append(x + c0 + blk.shape[1] / 2.0)
-            ys.append(y + float((blk * yy).sum() / cnt))
+        xs, ys = _centers_of(sub, x, y, bw, bh, step)
         if len(xs) >= 6:
-            out.append((np.array(xs), np.array(ys)))
+            out.append((xs, ys))
     return out
 
 

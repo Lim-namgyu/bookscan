@@ -234,10 +234,63 @@ object Straightener {
         return Pair(out, ch)
     }
 
-    /** 가로 괘선(밑줄·표 테두리·꼬리말 선)의 중심선 */
+    /** 부분 마스크의 열 묶음마다 세로 중심 (textlines._centers_of). inComp(r, c): 덩어리 픽셀인지 */
+    private fun centersOf(x: Int, y: Int, bw: Int, bh: Int, step: Int, inComp: (Int, Int) -> Boolean): Samples {
+        val xs = ArrayList<Double>()
+        val ys = ArrayList<Double>()
+        var c0 = 0
+        while (c0 < bw) {
+            val c1 = min(bw, c0 + step)
+            var cnt = 0
+            var sumY = 0.0
+            for (r in 0 until bh) for (c in c0 until c1) if (inComp(r, c)) {
+                cnt++; sumY += r
+            }
+            if (cnt >= 1) {
+                xs.add(x + c0 + (c1 - c0) / 2.0); ys.add(y + sumY / cnt)
+            }
+            c0 += step
+        }
+        return Samples(xs.toDoubleArray(), ys.toDoubleArray())
+    }
+
+    /**
+     * 가로 괘선(밑줄·표 테두리·꼬리말 선·머리글 장식선)의 중심선 (textlines.detect_rules).
+     *  1) 가늘고 긴 덩어리: 휘어 있어도(페이지 모서리의 곡면 잔재) 그대로 따라감
+     *  2) 열림 연산으로 남는 곧은 선: 글자와 붙은 밑줄처럼 덩어리로는 두꺼워 보이는 경우
+     */
     private fun detectRules(gray: Mat, ch: Double, minFrac: Double = 0.25): List<Samples> {
         val mask = textMask(gray)
         val w = mask.cols()
+        val step = max(2, ch.toInt())
+        val out = ArrayList<Samples>()
+        val boxes = ArrayList<IntArray>()
+        // 1) 가늘고 긴 덩어리
+        run {
+            val cc = components(mask, true)
+            val lab = cc.labels!!
+            for (i in 1 until cc.n) {
+                val x = cc.x(i)
+                val y = cc.y(i)
+                val bw = cc.w(i)
+                val bh = cc.h(i)
+                if (bw < w * minFrac || bh > bw * 0.2) continue
+                if (cc.area(i).toDouble() / max(bw, 1) > ch * 0.6) continue
+                // 열마다 두께가 얇아야(글자가 이어 붙은 줄은 제외): 두께의 중앙값
+                val thick = ArrayList<Double>()
+                for (c in 0 until bw) {
+                    var t = 0
+                    for (r in 0 until bh) if (lab[(y + r) * w + x + c] == i) t++
+                    if (t > 0) thick.add(t.toDouble())
+                }
+                if (thick.isEmpty() || median(thick.toDoubleArray()) > ch * 0.4) continue
+                val smp = centersOf(x, y, bw, bh, step) { r, c -> lab[(y + r) * w + x + c] == i }
+                if (smp.xs.size >= 6) {
+                    out.add(smp); boxes.add(intArrayOf(x, y, bw, bh))
+                }
+            }
+        }
+        // 2) 곧은 선 (열림 연산)
         val k = max(9, (ch * 4).toInt()) or 1
         val horiz = Mat()
         val kr = rect(k, 1)
@@ -247,8 +300,6 @@ object Straightener {
         val cc = components(horiz, true)
         horiz.release()
         val lab = cc.labels!!
-        val step = max(2, ch.toInt())
-        val out = ArrayList<Samples>()
         for (i in 1 until cc.n) {
             val x = cc.x(i)
             val y = cc.y(i)
@@ -257,24 +308,17 @@ object Straightener {
             if (bw < w * minFrac) continue
             val thick = cc.area(i).toDouble() / max(bw, 1)
             if (thick > ch * 0.9 || bh > bw * 0.2) continue
-            val xs = ArrayList<Double>()
-            val ys = ArrayList<Double>()
-            var c0 = 0
-            while (c0 < bw) {
-                val c1 = min(bw, c0 + step)
-                var cnt = 0
-                var sumY = 0.0
-                for (r in 0 until bh) for (c in c0 until c1) {
-                    if (lab[(y + r) * w + x + c] == i) {
-                        cnt++; sumY += r
-                    }
+            // 1)에서 이미 잡은 선과 겹치면 건너뜀
+            var dup = false
+            for (bx in boxes) {
+                val ox = min(x + bw, bx[0] + bx[2]) - max(x, bx[0])
+                if (ox > 0.8 * bw && y + bh >= bx[1] - ch && y <= bx[1] + bx[3] + ch) {
+                    dup = true; break
                 }
-                if (cnt >= 1) {
-                    xs.add(x + c0 + (c1 - c0) / 2.0); ys.add(y + sumY / cnt)
-                }
-                c0 += step
             }
-            if (xs.size >= 6) out.add(Samples(xs.toDoubleArray(), ys.toDoubleArray()))
+            if (dup) continue
+            val smp = centersOf(x, y, bw, bh, step) { r, c -> lab[(y + r) * w + x + c] == i }
+            if (smp.xs.size >= 6) out.add(smp)
         }
         return out
     }
