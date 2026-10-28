@@ -882,23 +882,44 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         ink.release()
         Imgproc.dilate(lines, tmp8, ellipse(5))
         Core.bitwise_or(keep, tmp8, keep)
+        // 색: 종이 색(누런 기)을 뺀 채도. 색 상자·그림·색 글씨 근처는 지우지 않는다
+        var lab: Mat? = null
+        var chroma: Mat? = null
+        var aP = 128.0
+        var bP = 128.0
         if (color) {
-            val lab = Mat()
-            Imgproc.cvtColor(norm, lab, Imgproc.COLOR_RGB2Lab)
+            val lb = Mat()
+            Imgproc.cvtColor(norm, lb, Imgproc.COLOR_RGB2Lab)
+            lab = lb
+            val labS = Mat()
+            if (s < 1.0) Imgproc.resize(lb, labS, Size(0.0, 0.0), s, s, Imgproc.INTER_AREA) else lb.copyTo(labS)
+            val lsb = ByteArray((labS.total() * 3).toInt()).also { labS.get(0, 0, it) }
+            labS.release()
+            val ppThr = paper * 0.97
+            val av = ArrayList<Byte>()
+            val bv = ArrayList<Byte>()
+            for (i in gs.indices) if ((gs[i].toInt() and 0xFF) >= ppThr) {
+                av.add(lsb[i * 3 + 1]); bv.add(lsb[i * 3 + 2])
+            }
+            if (av.isNotEmpty()) {
+                aP = percentileByHistogram(av.toByteArray(), 50.0)
+                bP = percentileByHistogram(bv.toByteArray(), 50.0)
+            }
             val ch = ArrayList<Mat>()
-            Core.split(lab, ch)
-            lab.release()
+            Core.split(lb, ch)
             val aF = Mat()
             val bF = Mat()
-            ch[1].convertTo(aF, CvType.CV_32F, 1.0, -128.0)
-            ch[2].convertTo(bF, CvType.CV_32F, 1.0, -128.0)
+            ch[1].convertTo(aF, CvType.CV_32F, 1.0, -aP)
+            ch[2].convertTo(bF, CvType.CV_32F, 1.0, -bP)
             ch.forEach { it.release() }
             Core.magnitude(aF, bF, aF)
             bF.release()
             Imgproc.GaussianBlur(aF, aF, Size(0.0, 0.0), 2.0)
-            Imgproc.threshold(aF, aF, CHROMA_KEEP, 255.0, Imgproc.THRESH_BINARY)
-            aF.convertTo(tmp8, CvType.CV_8U)
-            aF.release()
+            chroma = aF
+            val cm = Mat()
+            Imgproc.threshold(aF, cm, CHROMA_KEEP, 255.0, Imgproc.THRESH_BINARY)
+            cm.convertTo(tmp8, CvType.CV_8U)
+            cm.release()
             Core.bitwise_or(keep, tmp8, keep)
         }
         // near(0~1) → 흰색 기준 white = paper*(WB + (WT-WB)*near) → white - black (최소 1)
@@ -923,6 +944,28 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         val white8 = Mat()
         white.convertTo(white8, CvType.CV_8U)
         white.release()
+        // 색 처리용: fade = max(clip((1-t)/0.15, 0, 1), colored), colored = clip((chroma - K/2)/K, 0, 1)
+        // 순수한 흰색은 '색이 없는' 종이 부분만
+        var fade: Mat? = null
+        if (color) {
+            val fd = Mat()
+            t.convertTo(fd, CvType.CV_32F, -1.0 / 0.15, 1.0 / 0.15)
+            Core.max(fd, Scalar(0.0), fd)
+            Core.min(fd, Scalar(1.0), fd)
+            val col = Mat()
+            chroma!!.convertTo(col, CvType.CV_32F, 1.0 / CHROMA_KEEP, -0.5)
+            Core.max(col, Scalar(0.0), col)
+            Core.min(col, Scalar(1.0), col)
+            Core.max(fd, col, fd)
+            col.release()
+            fade = fd
+            val colMask = Mat()
+            Imgproc.threshold(chroma, colMask, CHROMA_KEEP * 0.5, 255.0, Imgproc.THRESH_BINARY)
+            colMask.convertTo(tmp8, CvType.CV_8U)
+            colMask.release()
+            Core.subtract(white8, tmp8, white8) // (t >= 1) 이면서 색이 없는 곳
+            chroma.release()
+        }
         // 곡선: 감마(글자 진하게)와 S자 곡선 t²(3-2t)(글자 둘레의 옅은 얼룩·비침을 흰색 쪽으로)을 섞는다.
         // 상자 테두리·밑줄 같은 옅은 긴 선 위에서는 S자를 쓰지 않는다(옅은 선이 사라지지 않게).
         //   sm = S_MIX * (1 - blur(dilate(lines)))  ;  u = t + sm * (S(t) - t)
@@ -943,19 +986,35 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         t.convertTo(t, CvType.CV_32F, 255.0 - BLACK_OUT, BLACK_OUT)
         val out = Mat()
         if (color) {
-            // 채널마다 같은 비율(y / g)로 → 색 유지
-            Core.max(gF, Scalar(1.0), gF)
-            Core.divide(t, gF, t)
-            norm.copyTo(out)
-            val cF = Mat()
-            for (c in 0 until 3) {
-                Core.extractChannel(norm, tmp8, c)
-                tmp8.convertTo(cF, CvType.CV_32F)
-                Core.multiply(cF, t, cF)
-                cF.convertTo(tmp8, CvType.CV_8U)
-                Core.insertChannel(tmp8, out, c)
+            // 밝기는 톤 곡선대로(L + (y - g)), 색(a, b)은 종이 색을 빼고 조금 진하게. 종이 부분은 순수한 흰색.
+            // (RGB 에 같은 비율을 곱하면 밝은 색이 255 에서 잘려 색이 바래므로 Lab 에서 처리)
+            val ch = ArrayList<Mat>()
+            Core.split(lab!!, ch)
+            lab.release()
+            val lF = Mat()
+            ch[0].convertTo(lF, CvType.CV_32F)
+            Core.subtract(t, gF, t)
+            Core.add(lF, t, lF)
+            val outCh = ArrayList<Mat>()
+            outCh.add(Mat().also { lF.convertTo(it, CvType.CV_8U) })
+            lF.release()
+            val k = COLOR_SAT
+            for ((c, ref) in listOf(1 to aP, 2 to bP)) {
+                val f = Mat()
+                ch[c].convertTo(f, CvType.CV_32F, 1.0, -ref)
+                Core.multiply(f, fade!!, f, k)
+                val o8 = Mat()
+                f.convertTo(o8, CvType.CV_8U, 1.0, 128.0)
+                f.release()
+                outCh.add(o8)
             }
-            cF.release()
+            ch.forEach { it.release() }
+            fade!!.release()
+            val labOut = Mat()
+            Core.merge(outCh, labOut)
+            outCh.forEach { it.release() }
+            Imgproc.cvtColor(labOut, out, Imgproc.COLOR_Lab2RGB)
+            labOut.release()
             out.setTo(Scalar(255.0, 255.0, 255.0), white8)
         } else {
             t.convertTo(out, CvType.CV_8U)
@@ -1339,7 +1398,8 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         const val INK_DARK = 0.62       // 종이 밝기의 이 배보다 어두우면 확실한 글자(인쇄 잉크)
         const val LINE_FAINT = 0.95     // 상자 테두리·밑줄처럼 긴 선은 옅어도 살림
         const val INK_NEAR = 0.006      // 글자 근처로 보는 거리(페이지 폭 비율)
-        const val CHROMA_KEEP = 14.0    // 이보다 색이 진하면(색 상자·그림) 살림
+        const val CHROMA_KEEP = 8.0     // 종이 색을 뺀 채도가 이보다 진하면(색 상자·그림·색 글씨) 살림
+        const val COLOR_SAT = 1.3       // 색을 이만큼 진하게(1 = 그대로)
         const val BLACK_INK_PCT = 50.0  // 글자 픽셀 밝기의 이 백분위를 완전한 검정으로
         const val BLACK_OUT = 12.0      // 검정이 놓일 값 (0으로 몰면 글자 가장자리가 뭉개짐)
         const val TONE_GAMMA = 1.5      // 1보다 크면 글자가 더 진하고 굵게

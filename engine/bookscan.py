@@ -673,7 +673,8 @@ WHITE_BG = 0.86       # 글자에서 떨어진 곳의 흰색 기준: 뒷면 비�
 INK_DARK = 0.62       # 종이 밝기의 이 배보다 어두우면 확실한 글자(인쇄 잉크)
 LINE_FAINT = 0.95     # 상자 테두리·밑줄처럼 긴 선은 옅어도 살림
 INK_NEAR = 0.006      # 글자 근처로 보는 거리(페이지 폭 비율)
-CHROMA_KEEP = 14.0    # 이보다 색이 진하면(색 상자·그림) 살림
+CHROMA_KEEP = 8.0     # 종이 색을 뺀 채도가 이보다 진하면(색 상자·그림·색 글씨) 살림
+COLOR_SAT = 1.3       # 색을 이만큼 진하게(1 = 그대로)
 BLACK_INK_PCT = 50.0  # 글자 픽셀 밝기의 이 백분위를 완전한 검정으로
 BLACK_OUT = 12.0      # 검정이 놓일 값 (0으로 몰면 글자 가장자리가 뭉개짐)
 TONE_GAMMA = 1.5      # 1보다 크면 글자가 더 진하고 굵게
@@ -712,9 +713,14 @@ def tone_map(norm):
     keep = cv2.dilate(ink, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))) | \
         cv2.dilate(lines, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
     if color:
+        # 색: 종이 색(누런 기)을 뺀 채도. 색 상자·그림·색 글씨 근처는 지우지 않는다
         lab = cv2.cvtColor(n8, cv2.COLOR_BGR2LAB).astype(np.float32)
-        chroma = np.hypot(lab[..., 1] - 128, lab[..., 2] - 128)
-        keep |= (cv2.GaussianBlur(chroma, (0, 0), 2) > CHROMA_KEEP).astype(np.uint8)
+        labs = cv2.resize(lab, (gs.shape[1], gs.shape[0]), interpolation=cv2.INTER_AREA) if s < 1 else lab
+        pp = gs >= paper * 0.97
+        a_p = float(np.median(labs[..., 1][pp])) if pp.any() else 128.0
+        b_p = float(np.median(labs[..., 2][pp])) if pp.any() else 128.0
+        chroma = cv2.GaussianBlur(np.hypot(lab[..., 1] - a_p, lab[..., 2] - b_p), (0, 0), 2)
+        keep |= (chroma > CHROMA_KEEP).astype(np.uint8)
     near = cv2.GaussianBlur(keep.astype(np.float32), (0, 0), max(1.0, r / 2.0))
     white = paper * (WHITE_BG + (WHITE_TEXT - WHITE_BG) * near)
     t = np.clip((g - black) / np.maximum(white - black, 1.0), 0, 1)
@@ -725,8 +731,15 @@ def tone_map(norm):
     u = (1.0 - sm) * t + sm * (t * t * (3.0 - 2.0 * t))
     y = BLACK_OUT + (255.0 - BLACK_OUT) * u ** TONE_GAMMA
     if color:
-        out = norm * (y / np.maximum(g, 1.0))[..., None]
-        out[t >= 1] = 255.0
+        # 밝기는 톤 곡선대로, 색(a, b)은 종이 색을 빼고 조금 진하게. 종이 부분은 순수한 흰색.
+        # (RGB 에 같은 비율을 곱하면 밝은 색이 255 에서 잘려 색이 바래므로 Lab 에서 처리)
+        colored = np.clip((chroma - CHROMA_KEEP * 0.5) / CHROMA_KEEP, 0, 1)
+        fade = np.maximum(np.clip((1.0 - t) / 0.15, 0, 1), colored)
+        Lp = lab[..., 0] + (y - g)
+        ap = 128.0 + (lab[..., 1] - a_p) * (COLOR_SAT * fade)
+        bp = 128.0 + (lab[..., 2] - b_p) * (COLOR_SAT * fade)
+        out = cv2.cvtColor(np.clip(np.dstack([Lp, ap, bp]), 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR).astype(np.float32)
+        out[(t >= 1) & (colored <= 0)] = 255.0
     else:
         out = y
     if SHARPEN > 0:
