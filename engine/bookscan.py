@@ -350,7 +350,11 @@ class Dewarper:
         # 합성: 최종 분석 픽셀 → fa 좌표 → flat_a 좌표 → 원본 사진 좌표
         fxa = cv2.remap(ax, sx + l, sy + t, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
         fya = cv2.remap(ay, sx + l, sy + t, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-        FW, FH = int(round(fw / a)), int(round(fh / a))
+        # 가로세로 비율 보정: 모델의 격자 길이로 잰 페이지 폭은 휘어 기울어진 부분이 사진에서 짧게 찍혀
+        # 실제보다 좁게 나온다(글자가 세로로 길쭉해짐). 지도의 국소 배율(가로/세로)이 평평한 곳에서 1이 되도록 폭을 맞춘다.
+        r_as = aspect_ratio_fix(fxa, fya)
+        info["aspect_fix"] = r_as
+        FW, FH = int(round(fw / a * r_as)), int(round(fh / a))
         FX = cv2.resize(fxa, (FW, FH), interpolation=cv2.INTER_LINEAR)
         FY = cv2.resize(fya, (FW, FH), interpolation=cv2.INTER_LINEAR)
         out = cv2.remap(img, FX, FY, cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
@@ -420,6 +424,28 @@ def isolate_page(p, pm):
 
 
 GRID_W, GRID_H, GRID_EXT = 31, 45, 1
+ASPECT_PCT = 75          # 국소 배율비의 이 백분위를 '평평한 곳'의 값으로 봄 (휜 곳은 가로가 짧게 찍혀 비가 작다)
+ASPECT_MIN, ASPECT_MAX = 0.85, 1.25
+
+
+def aspect_ratio_fix(mx, my):
+    """
+    출력 폭에 곱할 비율. mx, my: 출력(분석 해상도) 픽셀 → 원본 사진 좌표 지도.
+    가로 한 칸이 사진에서 차지하는 길이 / 세로 한 칸이 차지하는 길이 를 페이지 안쪽에서 재고,
+    평평한 곳(비가 큰 쪽)의 값을 쓴다. 그 값이 1보다 작으면 출력이 가로로 눌린 것이므로 폭을 그만큼 늘린다.
+    """
+    h, w = mx.shape
+    st = max(4, min(h, w) // 40)
+    ys = np.arange(int(h * 0.1), int(h * 0.9) - st, st)
+    xs = np.arange(int(w * 0.1), int(w * 0.9) - st, st)
+    if len(ys) < 3 or len(xs) < 3:
+        return 1.0
+    Y, X = np.meshgrid(ys, xs, indexing="ij")
+    ju = np.hypot(mx[Y, X + st] - mx[Y, X], my[Y, X + st] - my[Y, X])
+    jv = np.hypot(mx[Y + st, X] - mx[Y, X], my[Y + st, X] - my[Y, X])
+    ratio = ju / np.maximum(jv, 1e-6)
+    r = float(np.percentile(ratio, ASPECT_PCT))
+    return float(np.clip(r, ASPECT_MIN, ASPECT_MAX))
 
 
 def extend_grid_v(g, n):

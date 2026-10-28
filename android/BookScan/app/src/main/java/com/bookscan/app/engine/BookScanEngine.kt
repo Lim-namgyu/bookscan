@@ -392,8 +392,11 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         Imgproc.remap(ay, fya, sx, sy, Imgproc.INTER_LINEAR, Core.BORDER_REPLICATE, Scalar(0.0))
         ax.release(); ay.release(); sx.release(); sy.release()
 
+        // ---- 가로세로 비율 보정: 모델의 격자 길이로 잰 페이지 폭은 휘어 기울어진 부분이 사진에서 짧게 찍혀
+        // 실제보다 좁게 나온다(글자가 세로로 길쭉해짐). 지도의 국소 배율(가로/세로)이 평평한 곳에서 1이 되도록 폭을 맞춘다.
+        val rAs = aspectRatioFix(fxa, fya)
         // ---- 원본 해상도로 확대 후 한 번만 재샘플링
-        val fullW = max(16, rint(fw / a))
+        val fullW = max(16, rint(fw / a * rAs))
         val fullH = max(16, rint(fh / a))
         val fx = Mat()
         val fy = Mat()
@@ -418,6 +421,34 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         if (masked == null) return trimmed
         trimmed.release()
         return masked
+    }
+
+    /**
+     * bookscan.aspect_ratio_fix: 출력 폭에 곱할 비율. mx, my: 출력(분석 해상도) 픽셀 → 원본 사진 좌표 지도(CV_32F).
+     * 가로 한 칸이 사진에서 차지하는 길이 / 세로 한 칸이 차지하는 길이 를 페이지 안쪽에서 재고, 평평한 곳(비가 큰 쪽)의 값을 쓴다.
+     */
+    private fun aspectRatioFix(mx: Mat, my: Mat): Double {
+        val h = mx.rows()
+        val w = mx.cols()
+        val st = max(4, min(h, w) / 40)
+        val ys = ArrayList<Int>()
+        val xs = ArrayList<Int>()
+        var y = (h * 0.1).toInt()
+        while (y < (h * 0.9).toInt() - st) { ys.add(y); y += st }
+        var x = (w * 0.1).toInt()
+        while (x < (w * 0.9).toInt() - st) { xs.add(x); x += st }
+        if (ys.size < 3 || xs.size < 3) return 1.0
+        val ax = FloatArray(w * h).also { mx.get(0, 0, it) }
+        val ay = FloatArray(w * h).also { my.get(0, 0, it) }
+        val ratio = DoubleArray(ys.size * xs.size)
+        var k = 0
+        for (yy in ys) for (xx in xs) {
+            val i = yy * w + xx
+            val ju = hypot((ax[i + st] - ax[i]).toDouble(), (ay[i + st] - ay[i]).toDouble())
+            val jv = hypot((ax[i + st * w] - ax[i]).toDouble(), (ay[i + st * w] - ay[i]).toDouble())
+            ratio[k++] = ju / max(jv, 1e-6)
+        }
+        return percentile(ratio, ASPECT_PCT).coerceIn(ASPECT_MIN, ASPECT_MAX)
     }
 
     /** 격자(GRID_H x GRID_W, 행 우선)를 위아래로 n 행 직선 연장 */
@@ -1419,6 +1450,11 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
 
         /** 한 쪽 페이지가 이보다 가로로 길면 세로로 눕혀서 곡면 펴기 */
         const val LANDSCAPE_RATIO = 1.2
+
+        /** 가로세로 비율 보정: 국소 배율비의 이 백분위를 '평평한 곳'의 값으로 봄, 허용 범위 */
+        const val ASPECT_PCT = 75.0
+        const val ASPECT_MIN = 0.85
+        const val ASPECT_MAX = 1.25
 
         /** 책 옆면 줄무늬 판정: 변과 수직 방향 기울기 합이 나란한 방향의 이 배수보다 크면 */
         const val STREAK_RATIO = 2.2
