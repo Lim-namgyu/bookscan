@@ -867,6 +867,9 @@ def erase(out, mask):
 
 
 # ====================================================================== 전체 파이프라인
+LANDSCAPE_RATIO = 1.2  # 한 쪽 페이지가 이보다 가로로 길면 세로로 눕혀서 곡면 펴기
+
+
 class BookScanner:
     def __init__(self, model_path, straighten=True, region_model=None):
         self.dw = Dewarper(model_path)
@@ -899,7 +902,15 @@ class BookScanner:
             pm = hull_mask(pm)
             if pm is not None:
                 p, pm = isolate_page(p, pm)
+            # 곡면 펴기 모델은 세로로 긴 페이지를 기대한다. 가로로 인쇄된 쪽(표 등)을 돌려 세운 경우처럼
+            # 페이지가 가로로 길면 세로로 눕혀서 편 뒤 다시 돌린다.
+            land = p.shape[1] > p.shape[0] * LANDSCAPE_RATIO
+            if land:
+                p = cv2.rotate(p, cv2.ROTATE_90_CLOCKWISE)
+                pm = None if pm is None else cv2.rotate(pm, cv2.ROTATE_90_CLOCKWISE)
             flat, info = self.dw.rectify(p, straighten=self.straighten, mask=pm)
+            if land:
+                flat = cv2.rotate(flat, cv2.ROTATE_90_COUNTERCLOCKWISE)
             # 양면이면 왼쪽 페이지의 오른쪽, 오른쪽 페이지의 왼쪽이 접힌 선
             skip = None if len(parts) == 1 else ("right" if idx == 0 else "left")
             m = finger_mask(flat, skip)

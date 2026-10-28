@@ -102,11 +102,20 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
                         p = iso.first; pmUse = iso.second
                     }
                 }
-                val flat = try {
+                // 곡면 펴기 모델은 세로로 긴 페이지를 기대한다. 가로로 인쇄된 쪽(표 등)을 돌려 세운 경우처럼
+                // 페이지가 가로로 길면 세로로 눕혀서 편 뒤 다시 돌린다.
+                val land = p.cols() > p.rows() * LANDSCAPE_RATIO
+                if (land) {
+                    val r = PageAnalysis.rotate(p, 90)
+                    p.release(); p = r
+                    pmUse?.let { old -> pmUse = PageAnalysis.rotate(old, 90); old.release() }
+                }
+                val flat0 = try {
                     rectify(p, pmUse)
                 } finally {
                     p.release(); pmUse?.release()
                 }
+                val flat = if (land) PageAnalysis.rotate(flat0, 270).also { flat0.release() } else flat0
                 val skip = if (parts.size == 1) null else if (i == 0) Side.RIGHT else Side.LEFT
                 DewarpedPage(flat, skip)
             }
@@ -1325,6 +1334,9 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
 
         /** 모델 격자를 위아래로 연장할 칸 수 */
         const val GRID_EXT = 1
+
+        /** 한 쪽 페이지가 이보다 가로로 길면 세로로 눕혀서 곡면 펴기 */
+        const val LANDSCAPE_RATIO = 1.2
 
         /** 책 옆면 줄무늬 판정: 변과 수직 방향 기울기 합이 나란한 방향의 이 배수보다 크면 */
         const val STREAK_RATIO = 2.2

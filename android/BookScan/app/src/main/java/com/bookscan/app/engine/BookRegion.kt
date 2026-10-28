@@ -113,6 +113,12 @@ class BookRegion(modelBytes: ByteArray) : AutoCloseable {
         comp.setTo(Scalar(0.0))
         Imgproc.drawContours(comp, cnts, -1, Scalar(255.0), -1)
         cnts.forEach { it.release() }
+        if (paperOutside(rgb, comp) > PAPER_OUTSIDE_MAX) {
+            // 책 바깥이어야 할 곳이 대부분 종이(밝고 매끈함) → 페이지가 화면을 꽉 채웠거나 표·그림만 잡은 것.
+            // 이런 마스크로 자르면 페이지 일부가 잘려 나가므로 쓰지 않는다.
+            comp.release()
+            return null
+        }
         val m = Mat()
         Imgproc.resize(comp, m, Size(w.toDouble(), h.toDouble()), 0.0, 0.0, Imgproc.INTER_LINEAR)
         comp.release()
@@ -121,8 +127,63 @@ class BookRegion(modelBytes: ByteArray) : AutoCloseable {
         return Pair(m, box)
     }
 
+    /** region.paper_outside: 마스크(SIZE 격자, 0/255) 바깥 영역 중 종이처럼 보이는(밝고 매끈한) 비율. 긴 변 500px 에서 잰다 */
+    private fun paperOutside(rgb: Mat, comp: Mat): Double {
+        val h = rgb.rows()
+        val w = rgb.cols()
+        val s = 500.0 / max(h, w)
+        val sw = max(1, Math.rint(w * s).toInt())
+        val sh = max(1, Math.rint(h * s).toInt())
+        val small = Mat()
+        Imgproc.resize(rgb, small, Size(sw.toDouble(), sh.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
+        val g8 = Mat()
+        Imgproc.cvtColor(small, g8, Imgproc.COLOR_RGB2GRAY)
+        small.release()
+        val mm = Mat()
+        Imgproc.resize(comp, mm, Size(sw.toDouble(), sh.toDouble()), 0.0, 0.0, Imgproc.INTER_LINEAR)
+        val gF = Mat()
+        g8.convertTo(gF, CvType.CV_32F)
+        val gx = Mat()
+        val gy = Mat()
+        Imgproc.Sobel(gF, gx, CvType.CV_32F, 1, 0, 3)
+        Imgproc.Sobel(gF, gy, CvType.CV_32F, 0, 1, 3)
+        val n = sw * sh
+        val ax = FloatArray(n).also { gx.get(0, 0, it) }
+        val ay = FloatArray(n).also { gy.get(0, 0, it) }
+        val sm = ByteArray(n) { if (ax[it] * ax[it] + ay[it] * ay[it] < 1600f) 1 else 0 }
+        val smM = Mat(sh, sw, CvType.CV_8UC1).also { it.put(0, 0, sm) }
+        val k5 = Mat.ones(5, 5, CvType.CV_8UC1)
+        Imgproc.erode(smM, smM, k5)
+        k5.release()
+        smM.get(0, 0, sm)
+        val mb = ByteArray(n).also { mm.get(0, 0, it) }
+        val inside = BooleanArray(n) { (mb[it].toInt() and 0xFF) > 127 }
+        val outM = Mat(sh, sw, CvType.CV_8UC1).also { it.put(0, 0, ByteArray(n) { i -> if (inside[i]) 1 else 0 }) }
+        val k15 = Mat.ones(15, 15, CvType.CV_8UC1)
+        Imgproc.dilate(outM, outM, k15)
+        k15.release()
+        val dil = ByteArray(n).also { outM.get(0, 0, it) }
+        val gb = ByteArray(n).also { g8.get(0, 0, it) }
+        listOf(g8, mm, gF, gx, gy, smM, outM).forEach { it.release() }
+        val insideVals = ArrayList<Double>()
+        for (i in 0 until n) if (inside[i]) insideVals.add((gb[i].toInt() and 0xFF).toDouble())
+        if (insideVals.isEmpty()) return 0.0
+        val paper = BookScanEngine.percentile(insideVals.toDoubleArray(), 75.0)
+        var nOut = 0
+        var nPaper = 0
+        for (i in 0 until n) {
+            if (dil[i].toInt() != 0) continue
+            nOut++
+            if ((gb[i].toInt() and 0xFF) >= 0.85 * paper && sm[i].toInt() != 0) nPaper++
+        }
+        return if (nOut == 0) 0.0 else nPaper.toDouble() / nOut
+    }
+
     companion object {
         const val SIZE = 320
+
+        /** 마스크 바깥 중 종이처럼 보이는 비율이 이보다 크면 마스크를 믿지 않음 */
+        const val PAPER_OUTSIDE_MAX = 0.15
         private val MEAN = floatArrayOf(0.485f, 0.456f, 0.406f)
         private val STD = floatArrayOf(0.229f, 0.224f, 0.225f)
 

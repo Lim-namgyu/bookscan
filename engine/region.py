@@ -52,10 +52,37 @@ class BookRegion:
         cnts, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         comp = np.zeros_like(comp)
         cv2.drawContours(comp, cnts, -1, 255, -1)
+        if paper_outside(img, comp) > PAPER_OUTSIDE_MAX:
+            # 책 바깥이어야 할 곳이 대부분 종이(밝고 매끈함) → 페이지가 화면을 꽉 채웠거나 표·그림만 잡은 것.
+            # 이런 마스크로 자르면 페이지 일부가 잘려 나가므로 쓰지 않는다.
+            return None, None
         m = cv2.resize(comp, (w, h), interpolation=cv2.INTER_LINEAR)
         m = np.where(m > 127, 255, 0).astype(np.uint8)
         x, y, bw, bh = cv2.boundingRect(m)
         return m, (x, y, x + bw, y + bh)
+
+
+PAPER_OUTSIDE_MAX = 0.15  # 마스크 바깥 중 종이처럼 보이는 비율이 이보다 크면 마스크를 믿지 않음
+
+
+def paper_outside(img, comp):
+    """마스크(SAL_SIZE 격자, 0/255) 바깥 영역 중 종이처럼 보이는(밝고 매끈한) 비율. 긴 변 500px 에서 잰다."""
+    h, w = img.shape[:2]
+    s = 500.0 / max(h, w)
+    sw, sh = max(1, int(round(w * s))), max(1, int(round(h * s)))
+    g = cv2.cvtColor(cv2.resize(img, (sw, sh), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY).astype(np.float32)
+    mm = cv2.resize(comp, (sw, sh), interpolation=cv2.INTER_LINEAR) > 127
+    if not mm.any():
+        return 0.0
+    gx = cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3)
+    smooth = cv2.erode((gx * gx + gy * gy < 1600.0).astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+    paper = float(np.percentile(g[mm], 75))
+    out = cv2.dilate(mm.astype(np.uint8), np.ones((15, 15), np.uint8)) == 0
+    n_out = int(out.sum())
+    if n_out == 0:
+        return 0.0
+    return float(((g >= 0.85 * paper) & smooth & out).sum()) / n_out
 
 
 def hull_mask(m):

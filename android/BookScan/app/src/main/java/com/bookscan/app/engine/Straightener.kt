@@ -33,6 +33,12 @@ object Straightener {
 
     class Maps(val mapX: Mat, val mapY: Mat)
 
+    /** 곡면 펴기 뒤 남는 비틀림은 이보다 작다(도). 더 큰 세로획 기울기는 이탤릭 글꼴로 본다 */
+    private const val STEM_MAX = 6.0
+
+    /** 여백선 기울기와 글자 세로획 각도가 이보다(도) 다르면 덜 기울인 쪽을 믿음 */
+    private const val MARGIN_STEM_TOL = 2.0
+
     /** 입력: RGB(8UC3) 또는 GRAY(8UC1). 글자가 너무 적으면 null */
     fun maps(img: Mat): Maps? {
         val gray = Mat()
@@ -623,12 +629,26 @@ object Straightener {
         }
 
         // ---- 가로 보정: 여백선이 있으면 여백선으로, 없으면 글자 세로획 각도로
+        // 여백선 기울기와 세로획 각도가 크게 다르면(표처럼 줄 시작이 들쭉날쭉해 여백선을 잘못 잡았거나,
+        // 이탤릭체라 세로획이 원래 누운 경우) 둘 중 덜 기울인 쪽을 믿는다.
+        var stem: Double? = null
+        if (left != null) {
+            val st = stemAngle(gray, clean)
+            stem = st
+            val v0 = h * 0.1
+            val v1 = h * 0.9
+            val mDeg = Math.toDegrees(atan((left.at(v1) - left.at(v0)) / (v1 - v0)))
+            if (abs(mDeg - st) > MARGIN_STEM_TOL && abs(st) < abs(mDeg)) {
+                left = null; right = null
+            }
+        }
         val lm = left
         val rm = right
         var shear = 0.0
         if (lm == null) {
-            val stem = stemAngle(gray, clean)
-            if (abs(stem) >= 0.5) shear = tan(Math.toRadians(stem)) // 측정 오차 수준은 무시
+            val st = stem ?: stemAngle(gray, clean)
+            // 측정 오차 수준의 작은 값은 무시. 너무 크면 원래 기울어진 글꼴(이탤릭)이라 바로잡지 않음
+            if (abs(st) >= 0.5 && abs(st) <= STEM_MAX) shear = tan(Math.toRadians(st))
         }
         val l0 = lm?.at(h / 2.0) ?: 0.0
         val r0 = rm?.at(h / 2.0) ?: 0.0

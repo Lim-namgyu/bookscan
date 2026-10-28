@@ -227,6 +227,10 @@ def stem_angle(gray, clean):
     return float(-est)
 
 
+STEM_MAX = 6.0  # 곡면 펴기 뒤 남는 비틀림은 이보다 작다. 더 큰 세로획 기울기는 이탤릭 글꼴로 본다
+MARGIN_STEM_TOL = 2.0  # 여백선 기울기와 글자 세로획 각도가 이보다(도) 다르면 덜 기울인 쪽을 믿음
+
+
 def _straighten_core(gray, clean, ch, phi):
     """
     페이지를 '회전'하지 않는다. 회전하면, 글줄만 기울고 글자는 똑바로 선 경우(곡면 펴기 잔여 비틀림)에
@@ -303,11 +307,21 @@ def _straighten_core(gray, clean, ch, phi):
         a_r = _ransac_margin(T, X1, ch, h)
 
     # ---- 가로 보정: 여백선이 있으면 여백선으로, 없으면 글자 세로획 각도로
+    # 여백선 기울기와 세로획 각도가 크게 다르면(표처럼 줄 시작이 들쭉날쭉해 여백선을 잘못 잡았거나,
+    # 이탤릭체라 세로획이 원래 누운 경우) 둘 중 덜 기울인 쪽을 믿는다.
     stem = None
     shear = 0.0
-    if a_l is None:
+    if a_l is not None:
         stem = stem_angle(gray, clean)
-        if abs(stem) >= 0.5:  # 측정 오차 수준의 작은 값은 무시
+        v0, v1 = h * 0.1, h * 0.9
+        m_deg = float(np.degrees(np.arctan((_margin_at(a_l, v1) - _margin_at(a_l, v0)) / (v1 - v0))))
+        if abs(m_deg - stem) > MARGIN_STEM_TOL and abs(stem) < abs(m_deg):
+            a_l = a_r = None
+    if a_l is None:
+        if stem is None:
+            stem = stem_angle(gray, clean)
+        # 측정 오차 수준의 작은 값은 무시. 너무 크면 원래 기울어진 글꼴(이탤릭)이라 바로잡지 않음
+        if 0.5 <= abs(stem) <= STEM_MAX:
             shear = float(np.tan(np.radians(stem)))
     L0 = float(_margin_at(a_l, h / 2.0)) if a_l is not None else 0.0
     R0 = float(_margin_at(a_r, h / 2.0)) if a_r is not None else 0.0
