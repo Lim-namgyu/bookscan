@@ -70,6 +70,18 @@ object Straightener {
         }
     }
 
+    // ================================================================= 방향 판정(PageAnalysis)에서 쓰는 도우미
+
+    /** orient.align_score 용: 글줄마다 (시작 x, 끝 x, 중심 y 중앙값). 두 번째 값은 글자 높이 */
+    internal fun lineEnds(gray: Mat, minFrac: Double): Pair<List<DoubleArray>, Double?> {
+        val (lines, ch) = detectLines(gray, minFrac)
+        return Pair(lines.map { s -> doubleArrayOf(s.xs.minOrNull() ?: 0.0, s.xs.maxOrNull() ?: 0.0, median(s.ys)) }, ch)
+    }
+
+    /** straighten.find_skew: 마스크 덩어리 중심들로 찾은 글줄 기울기(도) */
+    internal fun skewOfMask(mask: Mat, ch: Double, maxDeg: Double): Double =
+        skewSearch(Centroids.of(components(mask, false)), ch, 0.0, maxDeg).first
+
     // ================================================================= 글자·글줄 찾기 (textlines.py)
 
     private fun textMask(gray: Mat): Mat {

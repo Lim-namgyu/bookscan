@@ -43,7 +43,9 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
     private val engine = viewModelScope.async(engineThread) {
         check(OpenCVLoader.initLocal()) { "OpenCV를 불러오지 못했습니다" }
         val bytes = app.assets.open("uvdoc.onnx").use { it.readBytes() }
-        BookScanEngine(bytes).also { engineInstance = it }
+        // 책 영역 찾기 모델(없거나 못 읽으면 사진 전체를 책으로 보고 계속)
+        val region = runCatching { app.assets.open("u2netp.onnx").use { it.readBytes() } }.getOrNull()
+        BookScanEngine(bytes, region).also { engineInstance = it }
     }
 
     private val sessionDir = File(app.filesDir, "session").apply {

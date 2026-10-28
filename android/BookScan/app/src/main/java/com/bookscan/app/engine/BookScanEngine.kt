@@ -13,6 +13,7 @@ import org.opencv.core.Scalar
 import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
 import java.nio.FloatBuffer
+import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.floor
 import kotlin.math.hypot
@@ -37,7 +38,7 @@ class DewarpedPage(val flat: Mat, val skipSide: Side?)
  *  4) 조명·그림자 평탄화, 대비·선명도 (컬러 / 회색 / 흑백)
  * 모든 Mat 은 RGB 순서를 쓴다.
  */
-class BookScanEngine(modelBytes: ByteArray) : AutoCloseable {
+class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null) : AutoCloseable {
 
     private val env: OrtEnvironment = OrtEnvironment.getEnvironment()
     private val session: OrtSession = env.createSession(
@@ -48,28 +49,70 @@ class BookScanEngine(modelBytes: ByteArray) : AutoCloseable {
         }
     )
 
+    /** 책 영역 찾기 (모델이 없으면 사진 전체를 책으로 봄) */
+    private val region: BookRegion? = regionModelBytes?.let { BookRegion(it) }
+
     override fun close() {
         session.close()
+        region?.close()
     }
 
     // ================================================================= 공개 API
 
     /** 1단계: 사진(RGB) → 곡면 편 페이지 목록 (양면이면 2장) */
     fun dewarpPages(rgb: Mat, layout: Layout): List<DewarpedPage> {
-        // 폰을 세로로 든 채 펼친 책을 찍으면 글이 옆으로 누워 있음 → 글이 바로 서도록 먼저 돌림
-        val rot = PageAnalysis.detectRotation(rgb)
-        val src = if (rot != 0) PageAnalysis.rotate(rgb, rot) else rgb
+        // 0) 책 영역: 책만 잘라내고(멀리서 찍어도 책이 화면을 채우게), 마스크는 바닥 지우기·접힌 선 찾기에 사용
+        var src = rgb
+        var bmask: Mat? = null
+        val reg = region?.let { r -> runCatching { r.mask(rgb) }.getOrNull() }
+        if (reg != null) {
+            val (m, box) = reg
+            val cb = BookRegion.cropBox(box, rgb.cols(), rgb.rows())
+            if (cb != null) {
+                src = rgb.submat(cb).clone()
+                bmask = m.submat(cb).clone()
+                m.release()
+            } else {
+                bmask = m
+            }
+        }
         try {
-            val gutter = if (layout == Layout.SINGLE) null else PageAnalysis.findGutter(src, layout == Layout.DOUBLE)
-            val parts = if (gutter != null) splitSpread(src, gutter) else listOf(src)
-            return parts.mapIndexed { i, p ->
-                val flat = rectify(p)
-                if (p !== src) p.release()
+            // 폰을 세로로 든 채 펼친 책을 찍으면 글이 옆으로 누워 있음 → 글이 바로 서도록 먼저 돌림
+            val rot = PageAnalysis.detectRotation(src)
+            if (rot != 0) {
+                val r = PageAnalysis.rotate(src, rot)
+                if (src !== rgb) src.release()
+                src = r
+                bmask?.let { old ->
+                    bmask = PageAnalysis.rotate(old, rot)
+                    old.release()
+                }
+            }
+            val gutter = if (layout == Layout.SINGLE) null else PageAnalysis.findGutter(src, layout == Layout.DOUBLE, bmask)
+            val parts = if (gutter != null) splitSpread(src, gutter, bmask) else listOf(Pair(src.clone(), bmask?.clone()))
+            return parts.mapIndexed { i, (p0, pm0) ->
+                var p = p0
+                val pm = BookRegion.hullMask(pm0)
+                pm0?.release()
+                var pmUse = pm
+                if (pm != null) {
+                    val iso = isolatePage(p, pm)
+                    if (iso != null) {
+                        p.release(); pm.release()
+                        p = iso.first; pmUse = iso.second
+                    }
+                }
+                val flat = try {
+                    rectify(p, pmUse)
+                } finally {
+                    p.release(); pmUse?.release()
+                }
                 val skip = if (parts.size == 1) null else if (i == 0) Side.RIGHT else Side.LEFT
                 DewarpedPage(flat, skip)
             }
         } finally {
             if (src !== rgb) src.release()
+            bmask?.release()
         }
     }
 
@@ -84,36 +127,120 @@ class BookScanEngine(modelBytes: ByteArray) : AutoCloseable {
         norm.release()
         if (hasMask) erase(out, mask!!)
         mask?.release()
-        cleanEdges(out)
+        cleanEdges(out, skipSide) // 손가락 검사에서 뺀 쪽 = 접힌 선 쪽
         return out
     }
 
     // ================================================================= 1. 양면 분리
 
-    /** 접힌 선 기준 좌/우 페이지. 반대쪽은 배경색으로 가린다. */
-    private fun splitSpread(img: Mat, gutter: Pair<Double, Double>): List<Mat> {
+    /** 접힌 선 기준 좌/우 페이지(새 Mat). 반대쪽은 배경색으로 가린다. 책 마스크도 같은 방식으로 나눈다. */
+    private fun splitSpread(img: Mat, gutter: Pair<Double, Double>, mask: Mat?): List<Pair<Mat, Mat?>> {
         val w = img.cols()
         val h = img.rows()
         val (a, b) = gutter
         val xTop = b
         val xBot = a * (h - 1) + b
         val bg = borderMedianColor(img)
-        val result = ArrayList<Mat>()
+        val result = ArrayList<Pair<Mat, Mat?>>()
         for (left in listOf(true, false)) {
-            val out = img.clone()
             val poly = if (left) {
                 MatOfPoint(Point(xTop, 0.0), Point(w.toDouble(), 0.0), Point(w.toDouble(), h.toDouble()), Point(xBot, h.toDouble()))
             } else {
                 MatOfPoint(Point(0.0, 0.0), Point(xTop, 0.0), Point(xBot, h.toDouble()), Point(0.0, h.toDouble()))
             }
-            Imgproc.fillPoly(out, listOf(poly), bg)
             val lo = if (left) 0 else max(0, min(xTop, xBot).toInt() - 10)
             val hi = if (left) min(w, max(xTop, xBot).toInt() + 10) else w
+            val out = img.clone()
+            Imgproc.fillPoly(out, listOf(poly), bg)
             val crop = out.submat(0, h, lo, hi).clone()
             out.release()
-            result.add(crop)
+            var pm: Mat? = null
+            if (mask != null) {
+                val mm = mask.clone()
+                Imgproc.fillPoly(mm, listOf(poly), Scalar(0.0))
+                pm = mm.submat(0, h, lo, hi).clone()
+                mm.release()
+            }
+            poly.release()
+            result.add(Pair(crop, pm))
         }
         return result
+    }
+
+    /**
+     * 곡면 펴기 모델 입력 정리: 페이지 상자(+여유)로 자르고, 페이지(조금 넓힌 마스크) 바깥은 단색으로 칠한다.
+     * 바닥 무늬·옆 페이지가 사라져 모델이 페이지 경계를 정확히 잡는다. 반환: (새 페이지, 새 마스크) 또는 null(그대로 사용)
+     */
+    private fun isolatePage(p: Mat, pm: Mat): Pair<Mat, Mat>? {
+        val h = p.rows()
+        val w = p.cols()
+        val r = Imgproc.boundingRect(pm)
+        if (r.width.toLong() * r.height < 0.1 * w * h) return null
+        val mx = (r.width * ISOLATE_MARGIN).toInt()
+        val my = (r.height * ISOLATE_MARGIN).toInt()
+        val x0 = max(0, r.x - mx)
+        val y0 = max(0, r.y - my)
+        val x1 = min(w, r.x + r.width + mx)
+        val y1 = min(h, r.y + r.height + my)
+        val roi = Rect(x0, y0, x1 - x0, y1 - y0)
+        val p2 = p.submat(roi).clone()
+        val pm2 = pm.submat(roi).clone()
+        val d = max(3, (max(r.width, r.height) * ISOLATE_DILATE).toInt()) or 1
+        val keep = Mat()
+        Imgproc.dilate(pm2, keep, ellipse(d))
+        val outside = Mat()
+        Core.compare(keep, Scalar(0.0), outside, Core.CMP_EQ)
+        p2.setTo(Scalar(ISOLATE_FILL, ISOLATE_FILL, ISOLATE_FILL), outside)
+        keep.release(); outside.release()
+        return Pair(p2, pm2)
+    }
+
+    /**
+     * 곡면 편 페이지에서 책 바깥(바닥·책상 무늬)을 지운다 (새 Mat 또는 null=그대로).
+     *  1) 마스크가 절반도 안 덮는 가장자리 행·열은 잘라내고
+     *  2) 남은 부분 중 마스크 바깥은 주변 종이색으로 메운다(손가락 메우기와 같은 방법) → 보정 후 흰색.
+     * 마스크 경계가 거칠어(320 격자) 조금 안쪽으로 줄여서 쓴다. 페이지 여백은 비어 있어 손실 없음.
+     */
+    private fun applyPageMask(flat: Mat, pm: Mat): Mat? {
+        val h = pm.rows()
+        val w = pm.cols()
+        val inside = Mat()
+        Imgproc.threshold(pm, inside, 127.0, 255.0, Imgproc.THRESH_BINARY)
+        try {
+            if (Core.countNonZero(inside) < 0.3 * w * h) return null // 마스크가 이상하면 손대지 않음
+            val e = max(3, (min(h, w) * PAGE_MASK_ERODE).toInt()) or 1
+            Imgproc.erode(inside, inside, ellipse(e))
+            val ib = ByteArray(w * h).also { inside.get(0, 0, it) }
+            val colc = IntArray(w)
+            val rowc = IntArray(h)
+            for (y in 0 until h) for (x in 0 until w) if (ib[y * w + x].toInt() != 0) {
+                colc[x]++; rowc[y]++
+            }
+            var x0 = -1; var x1 = -1; var nc = 0
+            for (x in 0 until w) if (colc[x] >= 0.5 * h) {
+                if (x0 < 0) x0 = x
+                x1 = x + 1; nc++
+            }
+            var y0 = -1; var y1 = -1; var nr = 0
+            for (y in 0 until h) if (rowc[y] >= 0.5 * w) {
+                if (y0 < 0) y0 = y
+                y1 = y + 1; nr++
+            }
+            if (nc < w * 0.5 || nr < h * 0.5) return null
+            val roi = Rect(x0, y0, x1 - x0, y1 - y0)
+            val res = flat.submat(roi).clone()
+            val outside = Mat()
+            Core.compare(inside.submat(roi), Scalar(0.0), outside, Core.CMP_EQ)
+            return if (Core.countNonZero(outside) > 0) {
+                val filled = fillPaper(res, outside)
+                res.release()
+                filled
+            } else {
+                res
+            }.also { outside.release() }
+        } finally {
+            inside.release()
+        }
     }
 
     private fun borderMedianColor(img: Mat): Scalar {
@@ -145,7 +272,7 @@ class BookScanEngine(modelBytes: ByteArray) : AutoCloseable {
      *   곡면 펴기 지도(모델) ∘ 테두리 자르기 ∘ 글줄 반듯하게 지도 를 합성해서
      *   원본 사진에서 단 한 번만 재샘플링한다(화질 손실 최소).
      */
-    private fun rectify(img: Mat): Mat {
+    private fun rectify(img: Mat, mask: Mat?): Mat {
         val w = img.cols()
         val h = img.rows()
         val inp = Mat()
@@ -266,10 +393,22 @@ class BookScanEngine(modelBytes: ByteArray) : AutoCloseable {
         fxa.release(); fya.release()
         val out = Mat()
         Imgproc.remap(img, out, fx, fy, Imgproc.INTER_CUBIC, Core.BORDER_REPLICATE, Scalar(0.0))
+        var pmOut: Mat? = null
+        if (mask != null) {
+            pmOut = Mat()
+            Imgproc.remap(mask, pmOut, fx, fy, Imgproc.INTER_LINEAR, Core.BORDER_CONSTANT, Scalar(0.0))
+        }
         fx.release(); fy.release()
-        val trimmed = trimDarkBorder(out)
-        if (trimmed !== out) out.release()
-        return trimmed
+        val (t2, b2, l2, r2) = trimRect(out)
+        val roi = Rect(l2, t2, out.cols() - l2 - r2, out.rows() - t2 - b2)
+        val trimmed = if (t2 + b2 + l2 + r2 == 0) out else out.submat(roi).clone().also { out.release() }
+        if (pmOut == null) return trimmed
+        val pmT = if (t2 + b2 + l2 + r2 == 0) pmOut else pmOut.submat(roi).clone().also { pmOut.release() }
+        val masked = applyPageMask(trimmed, pmT)
+        pmT.release()
+        if (masked == null) return trimmed
+        trimmed.release()
+        return masked
     }
 
     /** 격자(GRID_H x GRID_W, 행 우선)를 위아래로 n 행 직선 연장 */
@@ -306,11 +445,11 @@ class BookScanEngine(modelBytes: ByteArray) : AutoCloseable {
         val h = img.rows()
         val w = img.cols()
         val s = min(1.0, 1000.0 / max(h, w))
-        val small = Mat()
-        Imgproc.resize(img, small, Size(rint(w * s).toDouble(), rint(h * s).toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
+        val full = Mat()
+        if (img.channels() == 3) Imgproc.cvtColor(img, full, Imgproc.COLOR_RGB2GRAY) else img.copyTo(full)
         val gray = Mat()
-        if (small.channels() == 3) Imgproc.cvtColor(small, gray, Imgproc.COLOR_RGB2GRAY) else small.copyTo(gray)
-        small.release()
+        Imgproc.resize(full, gray, Size(rint(w * s).toDouble(), rint(h * s).toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
+        full.release()
         val sh = gray.rows()
         val sw = gray.cols()
         val g = ByteArray(sh * sw)
@@ -366,31 +505,47 @@ class BookScanEngine(modelBytes: ByteArray) : AutoCloseable {
             for (x in c0 until c1) if (busyB[y * sw + x].toInt() == 0) cnt++
             cnt.toDouble() / max(1, c1 - c0)
         }
-        fun tex(v: (Int) -> Double, n: Int, limit: Int): Int {
-            for (i in 0 until min(limit, n - 3)) {
-                if (v(i) >= 0.8 && v(i + 1) >= 0.8 && v(i + 2) >= 0.8) {
+        // 결 방향: 책 옆면(종이 단면)은 변과 나란한 줄무늬라 한 방향 기울기만 강하다. 글자는 두 방향 다 있음
+        val colGx = DoubleArray(sw)
+        val colGy = DoubleArray(sw)
+        for (y in r0 until r1) for (x in 0 until sw) {
+            colGx[x] += abs(gx[y * sw + x]).toDouble(); colGy[x] += abs(gy[y * sw + x]).toDouble()
+        }
+        val rowGx = DoubleArray(sh)
+        val rowGy = DoubleArray(sh)
+        for (y in 0 until sh) for (x in c0 until c1) {
+            rowGx[y] += abs(gx[y * sw + x]).toDouble(); rowGy[y] += abs(gy[y * sw + x]).toDouble()
+        }
+        /**
+         * 바깥에서 안으로 훑다가 빈 여백이 시작되는 곳(i)까지가 잘라낼 후보 띠.
+         *  - 띠 전체가 무늬(카펫 등): 한도 10%
+         *  - 띠가 변과 나란한 줄무늬(책 옆면, 두꺼운 책은 폭이 넓음): 한도 15%
+         * v: 빈 비율, along/across: 변과 수직/나란한 방향 기울기 합 (모두 바깥→안 순서로 꺼냄)
+         */
+        fun tex(v: (Int) -> Double, along: (Int) -> Double, across: (Int) -> Double, n: Int, limit: Int): Int {
+            for (i in 0 until min((limit * 1.5).toInt(), n - 3)) {
+                if (v(i) >= 0.75 && v(i + 1) >= 0.75 && v(i + 2) >= 0.75) {
                     if (i == 0) return 0
                     var sum = 0.0
-                    for (j in 0 until i) sum += v(j)
-                    return if (sum / i < 0.3) i else 0 // 잘라낼 띠가 '무늬'일 때만
+                    var sa = 0.0
+                    var sc = 0.0
+                    for (j in 0 until i) {
+                        sum += v(j); sa += along(j); sc += across(j)
+                    }
+                    if (i <= limit && sum / i < 0.3) return i // 잘라낼 띠가 '무늬'일 때만
+                    if (sa > STREAK_RATIO * sc) return i      // 변과 나란한 줄무늬(책 옆면)
+                    return 0
                 }
             }
             return 0
         }
         val limH2 = (sh * 0.10).toInt()
         val limW2 = (sw * 0.10).toInt()
-        t = max(t, tex({ rowb[it] }, sh, limH2))
-        bt = max(bt, tex({ rowb[sh - 1 - it] }, sh, limH2))
-        l = max(l, tex({ colb[it] }, sw, limW2))
-        r = max(r, tex({ colb[sw - 1 - it] }, sw, limW2))
+        t = max(t, tex({ rowb[it] }, { rowGy[it] }, { rowGx[it] }, sh, limH2))
+        bt = max(bt, tex({ rowb[sh - 1 - it] }, { rowGy[sh - 1 - it] }, { rowGx[sh - 1 - it] }, sh, limH2))
+        l = max(l, tex({ colb[it] }, { colGx[it] }, { colGy[it] }, sw, limW2))
+        r = max(r, tex({ colb[sw - 1 - it] }, { colGx[sw - 1 - it] }, { colGy[sw - 1 - it] }, sw, limW2))
         return Trim(rint(t / s), rint(bt / s), rint(l / s), rint(r / s))
-    }
-
-    /** 곡면 펴기 후 가장자리에 남은 책상·책 옆면의 어두운 띠를 잘라낸다. */
-    private fun trimDarkBorder(img: Mat): Mat {
-        val (t, bt, l, r) = trimRect(img)
-        if (t + bt + l + r == 0) return img
-        return img.submat(t, img.rows() - bt, l, img.cols() - r).clone()
     }
 
     // ================================================================= 3. 손가락 제거
@@ -626,8 +781,8 @@ class BookScanEngine(modelBytes: ByteArray) : AutoCloseable {
         val sb = ByteArray((small.total() * small.channels()).toInt())
         small.get(0, 0, sb)
         small.release()
-        val lo = percentileByHistogram(sb, 1.0)
         val hi = WHITE_POINT // 흰색 기준을 낮춰 뒷면 비침(밝기 200~235)도 지움
+        val lo = min(percentileByHistogram(sb, 1.0), hi - 1.0) // 거의 빈 페이지에서 0으로 나누지 않게
         val lutBytes = ByteArray(256) { v ->
             val t = ((v - lo) / max(hi - lo, 1.0)).coerceIn(0.0, 1.0)
             (t.pow(TONE_GAMMA) * 255.0).roundToInt().coerceIn(0, 255).toByte() // 감마>1: 옅은 글씨를 진하게
@@ -647,10 +802,14 @@ class BookScanEngine(modelBytes: ByteArray) : AutoCloseable {
     }
 
     /**
-     * 가장자리 띠(각 변의 3%) 안의 긴 세로선·가로선(페이지 경계선, 접힌 선 그림자, 책 옆면 줄무늬 찌꺼기)을 흰색으로.
-     * 글자는 짧은 획들이라 긴 선 모양 걸러내기(열림 연산)를 통과하지 못한다. out 을 직접 수정.
+     * 가장자리 띠(각 변의 4%, 접힌 선 쪽은 6%) 안의 선 찌꺼기(페이지 경계선, 접힌 선 그림자, 책 옆면 줄무늬)를 흰색으로.
+     *  - 긴 세로선·가로선: 글자는 짧은 획들이라 긴 선 모양 걸러내기(열림 연산)를 통과하지 못한다.
+     *  - 띠 안에 완전히 들어 있는 가늘고 긴 조각(변과 나란한 방향으로 2.5배 이상 김)
+     *  - 변에 붙은 잔무늬 덩어리(바닥 카펫·책 옆면 찌꺼기): 어두운 점이 빽빽한 곳이 변에 닿아 있고 안쪽으로 얕게(8% 이내)만 들어온 것.
+     *    본문 글은 여백 때문에 변에 닿지 않는다.
+     * out 을 직접 수정. gutterSide: 접힌 선 쪽
      */
-    private fun cleanEdges(out: Mat) {
+    private fun cleanEdges(out: Mat, gutterSide: Side?) {
         val h = out.rows()
         val w = out.cols()
         val gray = Mat()
@@ -664,28 +823,92 @@ class BookScanEngine(modelBytes: ByteArray) : AutoCloseable {
         val dark = Mat()
         Imgproc.threshold(g, dark, 199.0, 255.0, Imgproc.THRESH_BINARY_INV) // g < 200
         g.release()
+        val bl = max(2, (sw * (if (gutterSide == Side.LEFT) EDGE_GUTTER else EDGE_BAND)).toInt())
+        val br = max(2, (sw * (if (gutterSide == Side.RIGHT) EDGE_GUTTER else EDGE_BAND)).toInt())
+        val by = max(2, (sh * EDGE_BAND).toInt())
         val kv = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(1.0, max(5, (sh * 0.04).toInt()).toDouble()))
         val kh = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(max(5, (sw * 0.04).toInt()).toDouble(), 1.0))
         val vert = Mat()
         val horz = Mat()
         Imgproc.morphologyEx(dark, vert, Imgproc.MORPH_OPEN, kv)
         Imgproc.morphologyEx(dark, horz, Imgproc.MORPH_OPEN, kh)
-        dark.release(); kv.release(); kh.release()
+        kv.release(); kh.release()
         val vb = ByteArray(sh * sw).also { vert.get(0, 0, it) }
         val hb = ByteArray(sh * sw).also { horz.get(0, 0, it) }
         vert.release(); horz.release()
-        val bx = max(2, (sw * 0.03).toInt())
-        val by = max(2, (sh * 0.03).toInt())
         val mb = ByteArray(sh * sw)
         var any = false
         for (y in 0 until sh) for (x in 0 until sw) {
             val k = y * sw + x
-            val inX = x < bx || x >= sw - bx
+            val inX = x < bl || x >= sw - br
             val inY = y < by || y >= sh - by
             if ((inX && vb[k].toInt() != 0) || (inY && hb[k].toInt() != 0)) {
                 mb[k] = 255.toByte(); any = true
             }
         }
+        // 띠 안의 가늘고 긴 조각
+        run {
+            val lbl = Mat()
+            val st = Mat()
+            val cen = Mat()
+            val n = Imgproc.connectedComponentsWithStats(dark, lbl, st, cen, 8, CvType.CV_32S)
+            val stats = IntArray(n * 5).also { st.get(0, 0, it) }
+            val labels = IntArray(sh * sw).also { lbl.get(0, 0, it) }
+            lbl.release(); st.release(); cen.release()
+            val hit = BooleanArray(n)
+            for (i in 1 until n) {
+                val x = stats[i * 5]
+                val y = stats[i * 5 + 1]
+                val bw = stats[i * 5 + 2]
+                val bh = stats[i * 5 + 3]
+                val sideLr = (x + bw <= bl || x >= sw - br) && bh >= 2.5 * bw && bh >= sh * 0.01
+                val sideTb = (y + bh <= by || y >= sh - by) && bw >= 2.5 * bh && bw >= sw * 0.01
+                hit[i] = sideLr || sideTb
+            }
+            for (k in 0 until sh * sw) if (hit[labels[k]]) {
+                mb[k] = 255.toByte(); any = true
+            }
+        }
+        // 변에 붙은 잔무늬 덩어리
+        run {
+            val kk = max(5, (min(sh, sw) * 0.015).toInt()) or 1
+            val darkF = Mat()
+            dark.convertTo(darkF, CvType.CV_32F, 1.0 / 255.0)
+            val dens = Mat()
+            Imgproc.boxFilter(darkF, dens, -1, Size(kk.toDouble(), kk.toDouble()))
+            darkF.release()
+            val tex = Mat()
+            Imgproc.threshold(dens, tex, 0.10, 255.0, Imgproc.THRESH_BINARY)
+            dens.release()
+            val tex8 = Mat()
+            tex.convertTo(tex8, CvType.CV_8U)
+            tex.release()
+            val lbl = Mat()
+            val st = Mat()
+            val cen = Mat()
+            val n = Imgproc.connectedComponentsWithStats(tex8, lbl, st, cen, 8, CvType.CV_32S)
+            tex8.release(); cen.release()
+            val stats = IntArray(n * 5).also { st.get(0, 0, it) }
+            val labels = IntArray(sh * sw).also { lbl.get(0, 0, it) }
+            lbl.release(); st.release()
+            val tx = sw * 0.01
+            val ty = sh * 0.01
+            val dx = sw * EDGE_TEXTURE
+            val dy = sh * EDGE_TEXTURE
+            val hit = BooleanArray(n)
+            for (i in 1 until n) {
+                val x = stats[i * 5]
+                val y = stats[i * 5 + 1]
+                val bw = stats[i * 5 + 2]
+                val bh = stats[i * 5 + 3]
+                hit[i] = (x <= tx && x + bw <= dx) || (x + bw >= sw - tx && x >= sw - dx) ||
+                    (y <= ty && y + bh <= dy) || (y + bh >= sh - ty && y >= sh - dy)
+            }
+            for (k in 0 until sh * sw) if (hit[labels[k]]) {
+                mb[k] = 255.toByte(); any = true
+            }
+        }
+        dark.release()
         if (!any) return
         val m = Mat(sh, sw, CvType.CV_8UC1).also { it.put(0, 0, mb) }
         val k5 = Mat.ones(5, 5, CvType.CV_8UC1)
@@ -809,6 +1032,22 @@ class BookScanEngine(modelBytes: ByteArray) : AutoCloseable {
 
         /** 모델 격자를 위아래로 연장할 칸 수 */
         const val GRID_EXT = 1
+
+        /** 책 옆면 줄무늬 판정: 변과 수직 방향 기울기 합이 나란한 방향의 이 배수보다 크면 */
+        const val STREAK_RATIO = 2.2
+
+        /** 곡면 편 결과에서 책 마스크를 이 비율만큼 안쪽으로 줄여 씀(마스크 경계가 거침) */
+        const val PAGE_MASK_ERODE = 0.012
+
+        /** 곡면 펴기 모델 입력: 페이지 상자 바깥 여유, 마스크를 넓힐 비율, 바깥 칠할 색 */
+        const val ISOLATE_MARGIN = 0.03
+        const val ISOLATE_DILATE = 0.02
+        const val ISOLATE_FILL = 30.0
+
+        /** 가장자리 정리 띠 폭(각 변, 접힌 선 쪽), 변에 붙은 잔무늬 덩어리가 들어올 수 있는 깊이 */
+        const val EDGE_BAND = 0.04
+        const val EDGE_GUTTER = 0.06
+        const val EDGE_TEXTURE = 0.08
 
         fun median(v: DoubleArray): Double = percentile(v, 50.0)
 

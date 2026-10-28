@@ -3,17 +3,21 @@ package com.bookscan.app.engine
 import org.opencv.core.Core
 import org.opencv.core.CvType
 import org.opencv.core.Mat
+import org.opencv.core.MatOfPoint
+import org.opencv.core.MatOfPoint2f
+import org.opencv.core.Point
 import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
 import kotlin.math.abs
+import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.tan
 
 /**
  * 사진 전체를 보고 판단하는 단계 (engine/orient.py, engine/bookscan.py 의 find_gutter 와 같은 알고리즘·수치)
- *  - detectRotation: 글이 옆으로 누운 사진(폰을 세로로 들고 펼친 책을 찍은 경우)을 바로 세울 회전 각도
- *  - findGutter: 양면 펼침의 접힌 선 (두 페이지 글 사이 '글 없는 세로 띠' + 접힌 곳의 옅은 그림자)
+ *  - detectRotation: 글이 옆으로 눕거나 거꾸로 된 사진을 바로 세울 회전 각도
+ *  - findGutter: 양면 펼침의 접힌 선 (책 윤곽의 가운데 선 근처에서, 두 페이지 글 사이 '글 없는 세로 띠' + 접힌 곳의 옅은 그림자)
  * 입력은 모두 RGB.
  */
 object PageAnalysis {
@@ -84,7 +88,11 @@ object PageAnalysis {
 
     // ================================================================= 방향 (orient.py)
 
-    /** 글이 바로 서도록 시계 방향으로 돌릴 각도(0/90/180/270) */
+    /**
+     * 글이 바로 서도록 시계 방향으로 돌릴 각도(0/90/180/270).
+     * 가로/세로 글 판단 → 글줄이 수평이 되도록 기울기를 바로잡은 뒤(기울어진 채로는 점의 위아래 판정이 틀어짐)
+     * 두 단서의 합: 문장부호가 글줄 아래쪽에 있는가 + 줄 시작(왼쪽)이 가지런한가.
+     */
     fun detectRotation(rgb: Mat): Int {
         val g = toGray(rgb, 1600.0, true)
         try {
@@ -98,14 +106,62 @@ object PageAnalysis {
             m.release()
             val (sH, sV) = lineLikeness(cm, ch)
             cm.release()
-            val cands = if (sV > sH * VERT_RATIO) intArrayOf(90, 270) else intArrayOf(0, 180)
-            val (p0, _) = punctScoreRotated(g, cands[0])
-            val (p1, n1) = punctScoreRotated(g, cands[1])
-            if (cands[0] == 90) return if (p1 > p0) 270 else 90
-            return if (n1 >= 8 && p1 > p0 + 0.3) 180 else 0
+            val vert = sV > sH * VERT_RATIO
+            val base = if (vert) rotate(g, 90) else g
+            val d = deskew(base)
+            if (base !== g) base.release()
+            try {
+                val (p0, n0) = punctScore(d)
+                val (p1, n1) = punctScoreRotated(d, 180)
+                var vote = alignScore(d) * 2.0
+                if (n0 + n1 >= 6) vote += (p0 - p1) / 2.0
+                if (vert) return if (vote < 0) 270 else 90
+                return if (vote < -FLIP_MIN) 180 else 0
+            } finally {
+                d.release()
+            }
         } finally {
             g.release()
         }
+    }
+
+    /** orient.deskew: 글줄이 수평이 되도록 돌린 새 Mat */
+    private fun deskew(g: Mat): Mat {
+        val m = textMask(g)
+        val cc = components(m, true)
+        val ch = charHeight(cc, m.rows(), m.cols())
+        if (ch == null) {
+            m.release(); return g.clone()
+        }
+        val cm = charMask(cc, m.rows(), m.cols(), ch)
+        m.release()
+        val sk = Straightener.skewOfMask(cm, ch, 20.0)
+        cm.release()
+        val w = g.cols()
+        val h = g.rows()
+        val rm = Imgproc.getRotationMatrix2D(Point(w / 2.0, h / 2.0), sk, 1.0)
+        val out = Mat()
+        Imgproc.warpAffine(g, out, rm, Size(w.toDouble(), h.toDouble()), Imgproc.INTER_LINEAR, Core.BORDER_REPLICATE)
+        rm.release()
+        return out
+    }
+
+    /**
+     * orient.align_score: 줄 시작이 줄 끝보다 잘 맞춰져 있으면 +, 반대면 − (−1~1).
+     * 가로쓰기는 왼쪽 정렬이고 번호·문단 끝 짧은 줄 때문에 오른쪽 끝은 들쭉날쭉하다.
+     */
+    private fun alignScore(g: Mat): Double {
+        val (lines, ch) = Straightener.lineEnds(g, 0.04)
+        if (ch == null || lines.size < 6) return 0.0
+        val tol = ch * 0.6
+        var s = 0L
+        var e = 0L
+        for (i in lines.indices) for (j in lines.indices) {
+            if (i == j || abs(lines[j][2] - lines[i][2]) >= ch * 12) continue // 같은 단·가까운 줄끼리만
+            if (abs(lines[j][0] - lines[i][0]) < tol) s++
+            if (abs(lines[j][1] - lines[i][1]) < tol) e++
+        }
+        return (s - e).toDouble() / max(1L, s + e)
     }
 
     /** RGB 사진을 시계 방향으로 deg 만큼 돌린 새 Mat */
@@ -121,6 +177,9 @@ object PageAnalysis {
     }
 
     private const val VERT_RATIO = 1.5
+
+    /** 가로 글을 거꾸로(180°) 돌리려면 이만큼 뚜렷한 근거가 있어야 함 (거꾸로 찍는 일은 드묾) */
+    private const val FLIP_MIN = 0.5
 
     /** 글자 크기·모양(가늘고 긴 조각 제외)인 덩어리만, 사진 가운데 80% 안 */
     private fun charMask(cc: CC, rows: Int, cols: Int, ch: Double): Mat {
@@ -241,20 +300,42 @@ object PageAnalysis {
 
     // ================================================================= 양면 접힌 선 (bookscan.find_gutter)
 
-    /** 양면 펼침이면 접힌 선 x = a*y + b (원본 좌표), 아니면 null */
-    fun findGutter(rgb: Mat, force: Boolean): Pair<Double, Double>? {
+    /** numpy.linspace(a, b, n)[i] 와 비트 단위로 같은 값 */
+    private fun lin(a: Double, b: Double, n: Int, i: Int): Double = if (i == n - 1) b else i * ((b - a) / (n - 1)) + a
+
+    /**
+     * 양면 펼침이면 접힌 선 x = a*y + b (원본 좌표), 아니면 null.
+     * 접힌 선 = 두 페이지 글 사이의 '글 없는 세로 띠'를 위에서 아래까지 가장 여유 있게 지나는 직선.
+     * mask(책 영역, rgb 와 같은 크기)가 있으면: 책이 가로로 긴지(양면)로 판단하고, 책 바깥 변의 가운데 선 근처에서만 찾는다.
+     */
+    fun findGutter(rgb: Mat, force: Boolean, mask: Mat? = null): Pair<Double, Double>? {
         val h = rgb.rows()
         val w = rgb.cols()
         val s = 800.0 / max(h, w)
-        val gray = toGray(rgb, 800.0, false)
+        val small = Mat()
+        Imgproc.resize(rgb, small, Size(0.0, 0.0), s, s, Imgproc.INTER_AREA)
+        val gray = Mat()
+        if (small.channels() == 3) Imgproc.cvtColor(small, gray, Imgproc.COLOR_RGB2GRAY) else small.copyTo(gray)
+        small.release()
         val sh = gray.rows()
         val sw = gray.cols()
         try {
-            if (!force && sw < sh * 1.05) return null // 세로로 긴 사진은 한 페이지
+            var axis: DoubleArray? = null
+            if (mask != null) {
+                val ms = Mat()
+                Imgproc.resize(mask, ms, Size(sw.toDouble(), sh.toDouble()), 0.0, 0.0, Imgproc.INTER_LINEAR)
+                axis = bookAxis(ms)
+                ms.release()
+            }
+            if (axis != null) {
+                if (!force && axis[2] < SPREAD_ASPECT) return null // 책이 세로로 길면 한 쪽
+            } else if (!force && sw < sh * 1.05) {
+                return null // 세로로 긴 사진은 한 페이지
+            }
             val txt = textMaskSmall(gray)
             val cx = (sw - 1) / 2.0
             val nb = 14
-            val ys = IntArray(nb + 1) { (sh * 0.06 + it * (sh * 0.88) / nb).toInt() }
+            val ys = IntArray(nb + 1) { lin(sh * 0.06, sh * 0.94, nb + 1, it).toInt() }
             val yc = DoubleArray(nb) { (ys[it] + ys[it + 1]) / 2.0 }
             val cap = max(3.0, sw * 0.03)
             val lo = max(0.0, cx - sw * 0.22).toInt()
@@ -279,32 +360,74 @@ object PageAnalysis {
             val span = yc[nb - 1] - yc[0]
             val maxDx = tan(Math.toRadians(15.0)) * span
             val tk = DoubleArray(nb) { (yc[it] - yc[0]) / span }
-            var bestScore = -Double.MAX_VALUE
-            var bestT = lo
-            var bestB = lo
-            var bestHits = 0
-            for (xt in lo..hi) {
-                for (xb in lo..hi) {
-                    if (abs(xb - xt) > maxDx) continue
+            val nx = hi - lo + 1
+            val score = DoubleArray(nx * nx)
+            val hits = IntArray(nx * nx)
+            val pt = if (axis != null) axis[0] * yc[0] + axis[1] else 0.0
+            val pb = if (axis != null) axis[0] * yc[nb - 1] + axis[1] else 0.0
+            val cxx = if (axis != null) (pt + pb) / 2.0 else cx
+            var best = -Double.MAX_VALUE
+            for (i in 0 until nx) {
+                val xt = lo + i
+                for (j in 0 until nx) {
+                    val xb = lo + j
+                    val idx = i * nx + j
                     var sc = 0.0
-                    var hits = 0
+                    var ht = 0
                     for (k in 0 until nb) {
                         val xk = Math.rint(xt + (xb - xt) * tk[k]).toInt().coerceIn(0, sw - 1)
                         val c = clear[k][xk]
                         sc += c
-                        if (c > 0) hits++
+                        if (c > 0) ht++
                     }
-                    sc -= 0.5 * cap * abs((xt + xb) / 2.0 - cx) / sw * nb // 같은 점수면 가운데 쪽
-                    if (sc > bestScore) {
-                        bestScore = sc; bestT = xt; bestB = xb; bestHits = hits
+                    hits[idx] = ht
+                    if (axis != null) {
+                        // 책 가운데 선 근처만, 가까울수록 우선
+                        val dev = (abs(xt - pt) + abs(xb - pb)) / 2.0
+                        sc -= AXIS_PULL * cap * dev / sw * nb
+                        if (abs(xt - pt) > sw * AXIS_WIN || abs(xb - pb) > sw * AXIS_WIN) sc = -1e18
+                    } else {
+                        sc -= 0.5 * cap * abs((xt + xb) / 2.0 - cx) / sw * nb // 같은 점수면 가운데 쪽
                     }
+                    if (abs(xb - xt) > maxDx) sc = -1e18
+                    score[idx] = sc
+                    if (sc > best) best = sc
                 }
             }
+            if (best < -1e17) return null
+            // 빈 띠 점수가 최고점 근처인 후보들을 점수 순으로 보며, '접힌 그림자'가 있는 첫 직선을 고른다.
+            val tol = GUTTER_TOL * nb * cap
+            val near = (0 until nx * nx).filter { score[it] >= best - tol }
+                .sortedWith(compareByDescending<Int> { score[it] }.thenByDescending { it })
+            val cands = ArrayList<Int>()
+            for (idx in near) {
+                val i = idx / nx
+                val j = idx % nx
+                if (cands.any { abs(i - it / nx) <= 2 && abs(j - it % nx) <= 2 }) continue
+                cands.add(idx)
+                if (cands.size >= GUTTER_CANDS) break
+            }
+            val paper = foldPaper(gray)
+            var kSel = 0
+            var fold = 0.0
+            for ((n, idx) in cands.withIndex()) {
+                val xt = (lo + idx / nx).toDouble()
+                val xb = (lo + idx % nx).toDouble()
+                val a0 = (xb - xt) / span
+                val f = foldShadow(paper, sh, sw, a0, xt - a0 * yc[0])
+                if (n == 0) fold = f
+                if (f >= FOLD_MIN) {
+                    kSel = n; fold = f; break
+                }
+            }
+            val sel = cands[kSel]
+            val bestT = (lo + sel / nx).toDouble()
+            val bestB = (lo + sel % nx).toDouble()
             val a = (bestB - bestT) / span
             val b = bestT - a * yc[0]
             val xm = (bestT + bestB) / 2.0
             if (!force) {
-                val frac = bestHits.toDouble() / max(1, informative)
+                val frac = hits[sel].toDouble() / max(1, informative)
                 var left = 0L
                 var right = 0L
                 val split = max(1, xm.toInt())
@@ -313,14 +436,114 @@ object PageAnalysis {
                     if (x >= xm.toInt()) right++
                 }
                 val balance = min(left, right).toDouble() / max(1L, max(left, right))
-                if (informative < 6 || frac < 0.7 || abs(xm - cx) > sw * 0.15 || balance < 0.25) return null
+                if (informative < 6 || frac < 0.7 || abs(xm - cxx) > sw * 0.15 || balance < 0.25) return null
                 // 진짜 접힌 선에는 종이가 꺾이며 생기는 옅은 그림자 골짜기가 있다(표의 칸 사이 빈 줄과 구분)
-                if (foldShadow(gray, a, b) < 0.012) return null
+                if (fold < FOLD_MIN) return null
             }
             return Pair(a, b / s)
         } finally {
             gray.release()
         }
+    }
+
+    private const val SPREAD_ASPECT = 1.1 // 책(마스크)이 이보다 가로로 길어야 양면 후보
+    private const val AXIS_PULL = 2.0     // 책 가운데 선에서 벗어난 만큼 깎는 점수(빈 띠 점수 단위)
+    private const val AXIS_WIN = 0.07     // 책 가운데 선에서 이 폭(사진 폭 비율) 안에서만 찾음
+    private const val GUTTER_TOL = 0.2    // 최고점에서 (띠 수 x 최대 여유)의 이 비율 안쪽이면 후보
+    private const val GUTTER_CANDS = 24
+    private const val FOLD_MIN = 0.012
+
+    /** x = a*y + b, 튀는 점은 빼고 두 번 다시 맞춤 */
+    private fun robustLine(Y: DoubleArray, X: DoubleArray): Pair<Double, Double>? {
+        var keep = BooleanArray(Y.size) { true }
+        fun fit(): Pair<Double, Double>? {
+            val ys = ArrayList<Double>()
+            val xs = ArrayList<Double>()
+            for (i in Y.indices) if (keep[i]) {
+                ys.add(Y[i]); xs.add(X[i])
+            }
+            return BookScanEngine.polyfit1(ys, xs)
+        }
+        var ab = fit() ?: return null
+        repeat(2) {
+            val r = DoubleArray(Y.size) { X[it] - (ab.first * Y[it] + ab.second) }
+            val med = BookScanEngine.median(r)
+            val mad = BookScanEngine.median(DoubleArray(r.size) { abs(r[it] - med) }) + 1e-9
+            val k2 = BooleanArray(Y.size) { abs(r[it]) < max(2.0, 3.0 * mad) }
+            if (k2.count { it } < 5) return ab
+            keep = k2
+            ab = fit() ?: return ab
+        }
+        return ab
+    }
+
+    /**
+     * bookscan.book_axis: 책 마스크(작은 크기)에서 양면의 가운데 선 (a, b: x = a*y + b) 과 가로세로비.
+     * 가운데 높이(30~70%) 행마다 책의 왼쪽·오른쪽 바깥 변의 중점 → 두 페이지 폭이 같으므로 접힌 선은 거의 이 선 위.
+     * 책이 사진 밖으로 잘려 믿을 수 없으면 null
+     */
+    private fun bookAxis(maskSmall: Mat): DoubleArray? {
+        val sh = maskSmall.rows()
+        val sw = maskSmall.cols()
+        val mb = bytes(maskSmall)
+        fun on(y: Int, x: Int) = (mb[y * sw + x].toInt() and 0xFF) > 127
+        var y0 = -1
+        var y1 = -1
+        var nRows = 0
+        for (y in 0 until sh) {
+            var any = false
+            for (x in 0 until sw) if (on(y, x)) {
+                any = true; break
+            }
+            if (any) {
+                if (y0 < 0) y0 = y
+                y1 = y; nRows++
+            }
+        }
+        if (nRows < 20) return null
+        val Y = ArrayList<Double>()
+        val L = ArrayList<Double>()
+        val R = ArrayList<Double>()
+        for (y in (y0 + 0.3 * (y1 - y0)).toInt()..(y0 + 0.7 * (y1 - y0)).toInt()) {
+            var l = -1
+            var r = -1
+            for (x in 0 until sw) if (on(y, x)) {
+                if (l < 0) l = x
+                r = x
+            }
+            if (l >= 0) {
+                Y.add(y.toDouble()); L.add(l.toDouble()); R.add(r.toDouble())
+            }
+        }
+        if (Y.size < 10) return null
+        if (L.count { it <= 1 } > 0.3 * L.size || R.count { it >= sw - 2 } > 0.3 * R.size) return null // 책 바깥 변이 사진 밖
+        val yArr = Y.toDoubleArray()
+        val (al, bl) = robustLine(yArr, L.toDoubleArray()) ?: return null
+        val (ar, br) = robustLine(yArr, R.toDoubleArray()) ?: return null
+        // 가로세로비: 책을 감싸는 가장 작은 회전 사각형의 (가로에 가까운 변) / (세로에 가까운 변)
+        val bin = Mat()
+        Imgproc.threshold(maskSmall, bin, 127.0, 255.0, Imgproc.THRESH_BINARY)
+        val cnts = ArrayList<MatOfPoint>()
+        val hier = Mat()
+        Imgproc.findContours(bin, cnts, hier, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
+        hier.release(); bin.release()
+        if (cnts.isEmpty()) return null
+        val c = cnts.maxByOrNull { Imgproc.contourArea(it) }!!
+        val c2 = MatOfPoint2f(*c.toArray())
+        val rr = Imgproc.minAreaRect(c2)
+        c2.release()
+        cnts.forEach { it.release() }
+        val p = arrayOfNulls<Point>(4)
+        rr.points(p)
+        val v1x = p[1]!!.x - p[0]!!.x
+        val v1y = p[1]!!.y - p[0]!!.y
+        val v2x = p[2]!!.x - p[1]!!.x
+        val v2y = p[2]!!.y - p[1]!!.y
+        val n1 = hypot(v1x, v1y)
+        val n2 = hypot(v2x, v2y)
+        if (n1 < 1 || n2 < 1) return null
+        val aspect = if (abs(v1x) / n1 >= abs(v2x) / n2) n1 / n2 else n2 / n1
+        return doubleArrayOf((al + ar) / 2.0, (bl + br) / 2.0, aspect)
     }
 
     /** bookscan._text_mask_small: 글자 픽셀(true). 그림·상자 테두리 같은 큰 덩어리는 제외 */
@@ -353,9 +576,8 @@ object PageAnalysis {
         for (x in 0 until n) out[x] = min(out[x], cap)
     }
 
-    /** 직선 x = a*y + b (작은 이미지 좌표) 를 따라 잰 그림자 골짜기 깊이(중앙값, 종이 밝기 대비 비율) */
-    private fun foldShadow(gray: Mat, a: Double, b: Double): Double {
-        val sh = gray.rows()
+    /** 글자·가는 선을 지운 종이 밝기 (8비트, 행 우선) */
+    private fun foldPaper(gray: Mat): ByteArray {
         val sw = gray.cols()
         val k = max(7, (sw * 0.025).toInt()) or 1
         val ker = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, Size(k.toDouble(), k.toDouble()))
@@ -364,10 +586,15 @@ object PageAnalysis {
         ker.release()
         val paper = bytes(paperM)
         paperM.release()
+        return paper
+    }
+
+    /** 직선 x = a*y + b (작은 이미지 좌표) 를 따라 잰 그림자 골짜기 깊이(중앙값, 종이 밝기 대비 비율) */
+    private fun foldShadow(paper: ByteArray, sh: Int, sw: Int, a: Double, b: Double): Double {
         val wv = max(6, (sw * 0.05).toInt())
         val rels = ArrayList<Double>()
         for (i in 0 until 12) {
-            val yy = sh * 0.1 + i * (sh * 0.8) / 11.0
+            val yy = lin(sh * 0.1, sh * 0.9, 12, i)
             val y0 = yy.toInt()
             val r0 = max(0, y0 - 8)
             val r1 = min(sh, y0 + 8)
