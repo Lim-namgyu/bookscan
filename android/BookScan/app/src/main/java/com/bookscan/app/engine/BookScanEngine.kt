@@ -571,13 +571,13 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         val nAlong = if (vertical) sh else sw
         val nDepth = if (vertical) sw else sh
         fun at(a: Int, d: Int): Boolean { // a: 변을 따라 위치, d: 변에서 깊이(0 = 변)
-            val (yy, xx) = when (side) {
-                0 -> Pair(a, d)
-                1 -> Pair(a, sw - 1 - d)
-                2 -> Pair(d, a)
-                else -> Pair(sh - 1 - d, a)
+            val idx = when (side) {
+                0 -> a * sw + d
+                1 -> a * sw + sw - 1 - d
+                2 -> d * sw + a
+                else -> (sh - 1 - d) * sw + a
             }
-            return c[yy * sw + xx].toInt() != 0
+            return c[idx].toInt() != 0
         }
         val depth = IntArray(nAlong)
         var dmax = 0
@@ -642,7 +642,8 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         val p60 = percentile(lArr, 60.0)
         val paperA = ArrayList<Float>()
         for (i in 0 until n) if (lArr[i] > p60) paperA.add(aArr[i])
-        val a0 = if (paperA.isEmpty()) 0f else percentile(paperA.toFloatArray(), 50.0)
+        if (paperA.isEmpty()) return Mat.zeros(h, w, CvType.CV_8UC1) // 밝기가 고른 이미지: 종이 기준을 못 잡음
+        val a0 = percentile(paperA.toFloatArray(), 50.0)
 
         // 피부: 종이보다 붉은기(a*)가 확실히 높고, 색상각 25~60°, 채도 있음 (바랜 종이·책 옆면은 60° 이상)
         val skinBytes = ByteArray(n)
@@ -776,7 +777,8 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         Core.add(g, Scalar(1.0), g)
 
         // 원본 해상도에서는 마스크 주변 영역만, 채널 하나씩: out = (img*(1-soft) + ref*soft) * g
-        val roiS = expand(Imgproc.boundingRect(ring8), 10, ss)
+        // 축소하며 사라진 가는 마스크 조각(가장자리 쐐기 끝 등)도 처리 범위에 들도록 원본 마스크 상자와 합침
+        val roiS = expand(union(Imgproc.boundingRect(ring8), toSmall(Imgproc.boundingRect(mask), s)), 10, ss)
         val roiF = toFull(roiS, s, w, h)
         val out = img.clone()
         val gUp = Mat()
@@ -1192,7 +1194,7 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         val d = max(5, (min(ss.width, ss.height) * 0.04).toInt()) or 1
         val ringS = Mat()
         Imgproc.dilate(mS, ringS, ellipse(d))
-        val roiS = expand(Imgproc.boundingRect(ringS), 6, ss)
+        val roiS = expand(union(Imgproc.boundingRect(ringS), toSmall(Imgproc.boundingRect(mask), s)), max(6, (18 * s).toInt() + 1), ss)
         Imgproc.GaussianBlur(ringS, ringS, Size(0.0, 0.0), max(1.0, 6.0 * s))
         val roiF = toFull(roiS, s, w, h)
 
@@ -1282,6 +1284,26 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         val x1 = min(size.width.toInt(), r.x + r.width + pad)
         val y1 = min(size.height.toInt(), r.y + r.height + pad)
         return Rect(x0, y0, max(1, x1 - x0), max(1, y1 - y0))
+    }
+
+    /** 원본 좌표 상자 → 축소(배율 s) 좌표 상자(바깥으로 반올림) */
+    private fun toSmall(r: Rect, s: Double): Rect {
+        val x0 = floor(r.x * s).toInt()
+        val y0 = floor(r.y * s).toInt()
+        val x1 = ceil((r.x + r.width) * s).toInt()
+        val y1 = ceil((r.y + r.height) * s).toInt()
+        return Rect(x0, y0, max(0, x1 - x0), max(0, y1 - y0))
+    }
+
+    /** 두 상자를 감싸는 상자 (크기 0인 상자는 무시) */
+    private fun union(a: Rect, b: Rect): Rect {
+        if (b.width <= 0 || b.height <= 0) return a
+        if (a.width <= 0 || a.height <= 0) return b
+        val x0 = min(a.x, b.x)
+        val y0 = min(a.y, b.y)
+        val x1 = max(a.x + a.width, b.x + b.width)
+        val y1 = max(a.y + a.height, b.y + b.height)
+        return Rect(x0, y0, x1 - x0, y1 - y0)
     }
 
     private fun toFull(r: Rect, s: Double, w: Int, h: Int): Rect {
