@@ -690,7 +690,18 @@ def flatten_illumination(img):
     bg = cv2.GaussianBlur(bg, (0, 0), 5)
     bg = cv2.resize(bg, (w, h), interpolation=cv2.INTER_CUBIC).astype(np.float32)
     out = img.astype(np.float32) / np.maximum(bg, 1) * 255.0
+    # 어두운 곳은 밝히면서 노이즈도 같이 커진다(배율 = 255/배경 밝기) → 배율이 큰 곳만 살짝 흐려 잡음을 누른다
+    gain = 255.0 / np.maximum(bg.mean(axis=2), 1.0)
+    wn = np.clip((gain - DENOISE_GAIN0) / DENOISE_GAIN_SPAN, 0, 1)
+    if wn.max() > 0:
+        bl = cv2.GaussianBlur(out, (0, 0), DENOISE_SIGMA)
+        out = out + (bl - out) * wn[..., None]
     return np.clip(out, 0, 255)
+
+
+DENOISE_GAIN0 = 1.5      # 배율이 이보다 크면 흐리기 시작
+DENOISE_GAIN_SPAN = 2.5  # 배율 1.5+2.5=4(배경 밝기 64) 에서 완전히 흐림
+DENOISE_SIGMA = 1.0
 
 
 PAPER_PCT = 60        # 종이 밝기 = 조명 평탄화 후 밝기의 이 백분위

@@ -861,11 +861,46 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         Imgproc.GaussianBlur(bg, bg, Size(0.0, 0.0), 5.0)
         val bgFull = Mat()
         Imgproc.resize(bg, bgFull, img.size(), 0.0, 0.0, Imgproc.INTER_CUBIC)
-        bg.release()
         Core.max(bgFull, Scalar(1.0, 1.0, 1.0), bgFull)
         val out = Mat()
         Core.divide(img, bgFull, out, 255.0) // 8비트 포화 연산: img / bg * 255
         bgFull.release()
+        // 어두운 곳은 밝히면서 노이즈도 같이 커진다(배율 = 255/배경 밝기) → 배율이 큰 곳만 살짝 흐려 잡음을 누른다
+        //   wn = clip((255/mean(bg) - GAIN0) / SPAN, 0, 1) ;  out += (blur(out) - out) * wn
+        val bgGray = Mat()
+        Imgproc.cvtColor(bg, bgGray, Imgproc.COLOR_RGB2GRAY)
+        bg.release()
+        val wnS = Mat()
+        bgGray.convertTo(wnS, CvType.CV_32F)
+        bgGray.release()
+        Core.max(wnS, Scalar(1.0), wnS)
+        Core.divide(255.0, wnS, wnS)
+        wnS.convertTo(wnS, CvType.CV_32F, 1.0 / DENOISE_GAIN_SPAN, -DENOISE_GAIN0 / DENOISE_GAIN_SPAN)
+        Core.max(wnS, Scalar(0.0), wnS)
+        Core.min(wnS, Scalar(1.0), wnS)
+        val mm = Core.minMaxLoc(wnS)
+        if (mm.maxVal > 0.0) {
+            val wn = Mat()
+            Imgproc.resize(wnS, wn, img.size(), 0.0, 0.0, Imgproc.INTER_LINEAR)
+            val blur = Mat()
+            Imgproc.GaussianBlur(out, blur, Size(0.0, 0.0), DENOISE_SIGMA)
+            val o = Mat()
+            val b = Mat()
+            val c8 = Mat()
+            for (c in 0 until 3) {
+                Core.extractChannel(out, c8, c)
+                c8.convertTo(o, CvType.CV_32F)
+                Core.extractChannel(blur, c8, c)
+                c8.convertTo(b, CvType.CV_32F)
+                Core.subtract(b, o, b)
+                Core.multiply(b, wn, b)
+                Core.add(o, b, o)
+                o.convertTo(c8, CvType.CV_8U)
+                Core.insertChannel(c8, out, c)
+            }
+            listOf(wn, blur, o, b, c8).forEach { it.release() }
+        }
+        wnS.release()
         return out
     }
 
@@ -1457,6 +1492,9 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         const val TONE_GAMMA = 1.5      // 1보다 크면 글자가 더 진하고 굵게
         const val S_MIX = 0.6           // S자 곡선 섞는 비율(0~1): 클수록 글자 둘레 얼룩이 깨끗해지지만 옅은 인쇄도 옅어짐
         const val FLAT_PREBLUR = 1.5    // 조명 평탄화: 배경 추정 전 흐림(긴 변 1000px 기준)
+        const val DENOISE_GAIN0 = 1.5     // 조명 평탄화 배율이 이보다 크면 흐리기 시작
+        const val DENOISE_GAIN_SPAN = 2.5 // 배율 4(배경 밝기 64) 에서 완전히 흐림
+        const val DENOISE_SIGMA = 1.0
         const val SHARPEN = 0.3         // 언샤프 마스크 세기 (너무 세면 글자가 얼룩덜룩해짐)
         const val SHARPEN_SIGMA = 1.0
         const val BW_T = 140.0          // 흑백 모드: 톤 보정 후 이보다 어두우면 검정

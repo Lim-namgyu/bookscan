@@ -307,7 +307,7 @@ class CaptureReadiness(private val regionLoader: () -> BookRegion?) : ImageAnaly
         // 아래 수치는 실제 기기에서 써보며 조정할 값
         const val STILL_T = 1.5f        // 직전 프레임과 평균 밝기 차(%) 가 이보다 작으면 '멈춤'
         const val SHARP_T = 0.7f        // 또렷함 기준 (PC 시험: 또렷한 사진 1.1~5.7, 많이 흐린 사진 0.1~0.45)
-        const val DARK_T = 60f          // 책 영역 평균 밝기(0~255)가 이보다 어두우면 '어두움'
+        const val DARK_T = 85f          // 책 영역 평균 밝기(0~255)가 이보다 어두우면 '어두움' (어두우면 보정 후 잡음이 커짐)
         const val CLIP_T = 0.08f        // 밝기 250 이상(날아감) 비율이 이보다 크면 '너무 밝음'
         const val TILT_MAX = 20f        // 폰 기울기(도)
         const val AREA_MIN = 0.22f      // 책이 화면에서 차지하는 비율 최소
