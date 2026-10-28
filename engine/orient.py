@@ -3,12 +3,15 @@
   폰을 세로로 든 채 펼친 책을 찍으면 사진 속 글이 옆으로 누워 있다(글줄이 세로).
   1) 글줄이 가로인지 세로인지: 글자 크기·모양의 덩어리 중심점만으로 판단
      (책 옆면 줄무늬처럼 가늘고 긴 조각은 제외)
-  2) 위아래: 마침표·쉼표는 글줄의 아래쪽(밑줄 선)에 붙는다 → 아래쪽에 많은 방향이 바로 선 방향
+  2) 위아래 (글줄을 수평으로 돌린 뒤):
+     - 마침표·쉼표는 글줄의 아래쪽(밑줄 선)에 붙는다
+     - 줄 시작(왼쪽)은 가지런하고 줄 끝(오른쪽)은 들쭉날쭉하다
 """
 import cv2
 import numpy as np
 
-from textlines import char_height, clean_mask, text_mask
+from straighten import find_skew
+from textlines import char_height, clean_mask, detect_lines, text_mask
 
 
 def _rotate(img, deg_cw):
@@ -113,6 +116,40 @@ def punct_score(gray):
 
 
 VERT_RATIO = 1.5
+FLIP_MIN = 0.5   # 가로 글을 거꾸로(180°) 돌리려면 이만큼 뚜렷한 근거가 있어야 함 (거꾸로 찍는 일은 드묾)
+
+
+def deskew(g):
+    """글줄이 수평이 되도록 돌린 이미지와 기울기(도). 기울어진 채로는 점의 위아래 판정이 틀어진다."""
+    m = text_mask(g)
+    ch = char_height(m)
+    if ch is None:
+        return g, 0.0
+    sk = find_skew(_char_mask(m, ch), ch, 20.0)
+    h, w = g.shape
+    M = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), sk, 1.0)
+    return cv2.warpAffine(g, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE), sk
+
+
+def align_score(g):
+    """
+    줄 시작이 줄 끝보다 잘 맞춰져 있으면 +, 반대면 − (−1~1). 가로쓰기는 왼쪽 정렬이고
+    번호(①②…)·문단 끝 짧은 줄 때문에 오른쪽 끝은 들쭉날쭉하다. 거꾸로 놓이면 반대가 된다.
+    """
+    lines, ch = detect_lines(g, 0.04)
+    if ch is None or len(lines) < 6:
+        return 0.0, 0
+    st = np.array([xs.min() for xs, ys in lines])
+    en = np.array([xs.max() for xs, ys in lines])
+    yc = np.array([np.median(ys) for xs, ys in lines])
+    tol = ch * 0.6
+    s_ = e_ = 0
+    for i in range(len(lines)):
+        near = np.abs(yc - yc[i]) < ch * 12  # 같은 단·가까운 줄끼리만
+        near[i] = False
+        s_ += int((np.abs(st[near] - st[i]) < tol).sum())
+        e_ += int((np.abs(en[near] - en[i]) < tol).sum())
+    return (s_ - e_) / max(1, s_ + e_), len(lines)
 
 
 def detect_rotation(img, debug=None):
@@ -126,18 +163,22 @@ def detect_rotation(img, debug=None):
     if ch is None:
         return 0
     s_h, s_v = line_likeness(_char_mask(m, ch), ch)
-    cands = (90, 270) if s_v > s_h * VERT_RATIO else (0, 180)
-    p0, n0 = punct_score(_rotate(g, cands[0]))
-    p1, n1 = punct_score(_rotate(g, cands[1]))
+    vert = s_v > s_h * VERT_RATIO
+    base = _rotate(g, 90) if vert else g
+    d, sk = deskew(base)
+    # 두 단서의 합: 문장부호가 글줄 아래쪽에 있는가 + 줄 시작이 정렬되어 있는가
+    p0, n0 = punct_score(d)
+    p1, n1 = punct_score(_rotate(d, 180))
+    al, nl = align_score(d)
+    vote = al * 2.0
+    if n0 + n1 >= 6:
+        vote += (p0 - p1) / 2.0
     if debug is not None:
-        debug.update(ratio=s_v / max(s_h, 1e-9), cands=cands, p=(round(p0, 2), n0, round(p1, 2), n1))
-    if cands[0] == 90:
-        # 세로 글: 어느 쪽이든 돌려야 하므로 점 단서가 더 바로 선 쪽
-        return 270 if p1 > p0 else 90
-    # 가로 글: 거꾸로(180°)는 점 단서가 충분하고 뚜렷할 때만
-    if n1 >= 8 and p1 > p0 + 0.3:
-        return 180
-    return 0
+        debug.update(ratio=s_v / max(s_h, 1e-9), vert=vert, skew=round(sk, 1),
+                     p=(round(p0, 2), n0, round(p1, 2), n1), align=(round(al, 2), nl), vote=round(vote, 2))
+    if vert:
+        return 270 if vote < 0 else 90
+    return 180 if vote < -FLIP_MIN else 0
 
 
 def rotate_image(img, deg_cw):
@@ -153,4 +194,4 @@ if __name__ == "__main__":
         g = cv2.resize(g, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
         d = {}
         r = detect_rotation(im, d)
-        print("%-30s rot=%3d  v/h=%.2f cands=%s punct=%s" % (f.split("/")[-1], r, d.get("ratio", 0), d.get("cands"), d.get("p")))
+        print("%-30s rot=%3d  %s" % (f.split("/")[-1], r, d))
