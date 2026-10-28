@@ -1240,7 +1240,9 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
                 val a0 = if (vertical) y0 else x0
                 val a1 = if (vertical) y0 + bh else x0 + bw
                 val reachesEnd = a0 <= alongLo || a1 >= alongHi
-                if (boxy && !reachesEnd) continue
+                // 접힌 선 쪽: 페이지 높이의 절반 넘게 이어진 세로선은 상자 테두리에 닿아 있어도 접힌 곳 그림자다
+                val fold = side != null && side == gutterSide && (a1 - a0) >= EDGE_FOLD_LEN * sh
+                if (boxy && !reachesEnd && !fold) continue
                 for (y in y0 until y0 + bh) for (x in x0 until x0 + bw) {
                     val k = y * sw + x
                     if (slab[k] == j) {
@@ -1535,6 +1537,7 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         const val EDGE_BAND = 0.04
         const val EDGE_GUTTER = 0.06
         const val EDGE_TEXTURE = 0.08
+        const val EDGE_FOLD_LEN = 0.5      // 접힌 선 쪽 띠에서 이 비율(페이지 높이) 넘게 이어진 세로선은 상자 테두리로 보지 않음
         const val EDGE_STROKE_THIN = 0.006 // 변에 닿은 획을 지울 최대 굵기(페이지 폭 비율)
         const val EDGE_STROKE_MAX = 0.10   // 변에 닿은 획을 지울 최대 길이(페이지 높이 비율)
         const val EDGE_FAINT = 245 // 접힌 선 쪽 띠에서 그림자 선으로 볼 밝기 기준(이보다 어두우면)

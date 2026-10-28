@@ -864,7 +864,9 @@ def clean_edges(out, gutter_side=None):
             boxy = owner_big[y:y + bh, x:x + bw][pix].mean() > 0.5
             a0, a1 = (y, y + bh) if vertical else (x, x + bw)
             reaches_end = a0 <= along_lo or a1 >= along_hi
-            if boxy and not reaches_end:
+            # 접힌 선 쪽: 페이지 높이의 절반 넘게 이어진 세로선은 상자 테두리에 닿아 있어도 접힌 곳 그림자다
+            fold = name == gutter_side and (a1 - a0) >= EDGE_FOLD_LEN * sh
+            if boxy and not reaches_end and not fold:
                 continue
             m[y:y + bh, x:x + bw][pix] = 255
     n, lbl, st, _ = cv2.connectedComponentsWithStats(dark, 8)
@@ -910,6 +912,7 @@ EDGE_FAINT = 245      # 접힌 선 쪽 띠에서 그림자 선으로 볼 밝기 
 EDGE_BOX = 0.03       # 가장자리 선이 이보다 넓게(세로선) / 높게(가로선) 이어진 덩어리에 속하면 상자 테두리로 보고 남김
 EDGE_BAND = 0.04
 EDGE_GUTTER = 0.06
+EDGE_FOLD_LEN = 0.5   # 접힌 선 쪽 띠에서 이 비율(페이지 높이) 넘게 이어진 세로선은 상자 테두리로 보지 않음
 
 
 ERASE_LIGHT = 200  # 손가락 주변 띠에서 이보다 밝은 것(남은 옅은 그림자)만 흰색으로. 글자 가장자리 회색은 보존
