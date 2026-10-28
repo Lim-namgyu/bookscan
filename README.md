@@ -17,6 +17,8 @@ bookscan/
 3. 처음 실행하면 카메라 권한을 허용하세요.
 
 > GitHub에 올리면(main 브랜치) **GitHub Actions가 자동으로 APK를 빌드**해 Releases에 올립니다(`.github/workflows/build-apk.yml`). 휴대폰에서 Releases의 `BookScan-번호.apk`를 받아 바로 설치하면 됩니다.
+>
+> 엔진 코드가 바뀌면 **엔진 검사**(`.github/workflows/engine-test.yml`)도 돕니다: 앱에 들어가는 Kotlin 엔진을 PC(JVM)에서 그대로 실행해(`android/enginetest`) `engine/testdata/` 사진을 처리하고 파이썬 기준 구현 결과와 비교합니다. 두 결과 이미지는 Actions 의 Artifacts(`engine-outputs`)에서 내려받아 볼 수 있습니다.
 
 ## 기능
 
@@ -85,6 +87,7 @@ python bookscan.py 내사진.jpg --mode bw --layout double --out 결과
 
 - `bookscan.py` — 파이썬 기준 구현 (앱과 같은 알고리즘). `--no-straighten` 으로 글줄 반듯하게 단계를 끄고 비교할 수 있음
 - `straighten.py` — 글줄 반듯하게 (앱의 `engine/Straightener.kt` 와 같은 알고리즘)
+- `testdata/` — 검사용 사진, `compare_outputs.py` — 파이썬 결과와 앱 엔진 결과 비교
 - `textlines.py` — 글줄·괘선 찾기, 반듯함 측정 함수
 - `kt_mirror.py` — 안드로이드 코드의 OpenCV 호출을 그대로 옮긴 검증용 버전
 - `build_uvdoc_onnx.py` — UVDoc 원본 가중치(PyTorch 체크포인트)를 PyTorch 없이 ONNX로 변환

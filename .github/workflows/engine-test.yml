@@ -1,0 +1,58 @@
+# 앱 엔진 검사: 앱에 들어가는 Kotlin 엔진을 PC(JVM) 에서 그대로 실행해서
+# 파이썬 기준 구현(engine/bookscan.py)과 결과를 비교한다. 결과 이미지는 Artifacts 에 올린다.
+name: engine-test
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - engine/**
+      - android/BookScan/app/src/main/java/com/bookscan/app/engine/**
+      - android/BookScan/app/src/main/assets/*.onnx
+      - android/enginetest/**
+      - .github/workflows/engine-test.yml
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 파이썬 패키지
+        run: pip install --quiet numpy opencv-python-headless onnxruntime
+
+      - name: 파이썬 기준 구현 실행
+        run: |
+          python3 engine/bookscan.py --out py_out engine/testdata/*.jpg
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: 앱 엔진(JVM) 실행
+        working-directory: android/enginetest
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon --quiet installDist
+          build/install/enginetest/bin/enginetest ../BookScan/app/src/main/assets ../../kt_out ../../engine/testdata/*.jpg 2>&1 | tee ../../kt_log.txt
+
+      - name: 결과 비교
+        run: python3 engine/compare_outputs.py py_out kt_out | tee compare.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: engine-outputs
+          path: |
+            py_out
+            kt_out
+            kt_log.txt
+            compare.txt
