@@ -87,7 +87,7 @@ python bookscan.py 내사진.jpg --mode bw --layout double --out 결과
 
 - `bookscan.py` — 파이썬 기준 구현 (앱과 같은 알고리즘). `--no-straighten` 으로 글줄 반듯하게 단계를 끄고 비교할 수 있음
 - `straighten.py` — 글줄 반듯하게 (앱의 `engine/Straightener.kt` 와 같은 알고리즘)
-- `testdata/` — 검사용 사진, `compare_outputs.py` — 파이썬 결과와 앱 엔진 결과 비교
+- `testdata/` — 검사용 사진, `compare_outputs.py` — 파이썬 결과와 앱 엔진 결과 비교, `measure_outputs.py` — 결과 품질 수치표(글줄 기울기·휨·줄 간격·글자 비율)
 - `textlines.py` — 글줄·괘선 찾기, 반듯함 측정 함수
 - `kt_mirror.py` — 안드로이드 코드의 OpenCV 호출을 그대로 옮긴 검증용 버전
 - `build_uvdoc_onnx.py` — UVDoc 원본 가중치(PyTorch 체크포인트)를 PyTorch 없이 ONNX로 변환

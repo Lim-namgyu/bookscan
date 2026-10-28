@@ -57,9 +57,12 @@ jobs:
           python3 engine/compare_outputs.py py_out_bw kt_out_bw | tee -a compare.txt
           python3 engine/compare_outputs.py py_out_gray kt_out_gray | tee -a compare.txt
 
+      - name: 품질 수치 (앱 엔진 결과)
+        run: python3 engine/measure_outputs.py kt_out | tee measure.txt
+
       - name: 결과 묶기
         if: always()
-        run: zip -qr engine-outputs-${{ github.run_number }}.zip py_out* kt_out* kt_log.txt compare.txt
+        run: zip -qr engine-outputs-${{ github.run_number }}.zip py_out* kt_out* kt_log.txt compare.txt measure.txt
 
       - uses: actions/upload-artifact@v4
         if: always()
