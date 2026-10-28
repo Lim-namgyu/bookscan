@@ -50,7 +50,7 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
     )
 
     /** 책 영역 찾기 (모델이 없으면 사진 전체를 책으로 봄) */
-    private val region: BookRegion? = regionModelBytes?.let { BookRegion(it) }
+    private val region: BookRegion? = regionModelBytes?.let { runCatching { BookRegion(it) }.getOrNull() }
 
     override fun close() {
         session.close()
@@ -69,8 +69,8 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
             val (m, box) = reg
             val cb = BookRegion.cropBox(box, rgb.cols(), rgb.rows())
             if (cb != null) {
-                src = rgb.submat(cb).clone()
-                bmask = m.submat(cb).clone()
+                src = rgb.cropClone(cb)
+                bmask = m.cropClone(cb)
                 m.release()
             } else {
                 bmask = m
@@ -152,13 +152,13 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
             val hi = if (left) min(w, max(xTop, xBot).toInt() + 10) else w
             val out = img.clone()
             Imgproc.fillPoly(out, listOf(poly), bg)
-            val crop = out.submat(0, h, lo, hi).clone()
+            val crop = out.cropClone(0, h, lo, hi)
             out.release()
             var pm: Mat? = null
             if (mask != null) {
                 val mm = mask.clone()
                 Imgproc.fillPoly(mm, listOf(poly), Scalar(0.0))
-                pm = mm.submat(0, h, lo, hi).clone()
+                pm = mm.cropClone(0, h, lo, hi)
                 mm.release()
             }
             poly.release()
@@ -183,8 +183,8 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         val x1 = min(w, r.x + r.width + mx)
         val y1 = min(h, r.y + r.height + my)
         val roi = Rect(x0, y0, x1 - x0, y1 - y0)
-        val p2 = p.submat(roi).clone()
-        val pm2 = pm.submat(roi).clone()
+        val p2 = p.cropClone(roi)
+        val pm2 = pm.cropClone(roi)
         val d = max(3, (max(r.width, r.height) * ISOLATE_DILATE).toInt()) or 1
         val keep = Mat()
         Imgproc.dilate(pm2, keep, ellipse(d))
@@ -228,9 +228,9 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
             }
             if (nc < w * 0.5 || nr < h * 0.5) return null
             val roi = Rect(x0, y0, x1 - x0, y1 - y0)
-            val res = flat.submat(roi).clone()
+            val res = flat.cropClone(roi)
             val outside = Mat()
-            Core.compare(inside.submat(roi), Scalar(0.0), outside, Core.CMP_EQ)
+            inside.withRoi(roi) { Core.compare(it, Scalar(0.0), outside, Core.CMP_EQ) }
             return if (Core.countNonZero(outside) > 0) {
                 val filled = fillPaper(res, outside)
                 res.release()
@@ -249,8 +249,8 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         val n = rows * w * 3
         val top = ByteArray(n)
         val bot = ByteArray(n)
-        img.submat(0, rows, 0, w).clone().also { it.get(0, 0, top); it.release() }
-        img.submat(img.rows() - rows, img.rows(), 0, w).clone().also { it.get(0, 0, bot); it.release() }
+        img.cropClone(0, rows, 0, w).also { it.get(0, 0, top); it.release() }
+        img.cropClone(img.rows() - rows, img.rows(), 0, w).also { it.get(0, 0, bot); it.release() }
         val ch = Array(3) { DoubleArray(2 * rows * w) }
         var k = 0
         for (arr in listOf(top, bot)) {
@@ -353,7 +353,7 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
 
         // ---- 테두리 자르기 + 글줄 반듯하게 (분석 해상도)
         val (t, bt, l, r) = trimRect(flatA)
-        val fa = flatA.submat(t, ah - bt, l, aw - r).clone()
+        val fa = flatA.cropClone(t, ah - bt, l, aw - r)
         flatA.release()
         // 글줄 반듯하게 단계가 실패해도 페이지는 곡면 펴기 결과로 계속 진행
         val st = runCatching { Straightener.maps(fa) }.getOrNull()
@@ -401,9 +401,9 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         fx.release(); fy.release()
         val (t2, b2, l2, r2) = trimRect(out)
         val roi = Rect(l2, t2, out.cols() - l2 - r2, out.rows() - t2 - b2)
-        val trimmed = if (t2 + b2 + l2 + r2 == 0) out else out.submat(roi).clone().also { out.release() }
+        val trimmed = if (t2 + b2 + l2 + r2 == 0) out else out.cropClone(roi).also { out.release() }
         if (pmOut == null) return trimmed
-        val pmT = if (t2 + b2 + l2 + r2 == 0) pmOut else pmOut.submat(roi).clone().also { pmOut.release() }
+        val pmT = if (t2 + b2 + l2 + r2 == 0) pmOut else pmOut.cropClone(roi).also { pmOut.release() }
         val masked = applyPageMask(trimmed, pmT)
         pmT.release()
         if (masked == null) return trimmed
@@ -646,7 +646,11 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         return full
     }
 
-    /** 손가락 자리를 주변 종이색으로 메우고, 바로 옆 그림자를 밝힌다(조명 보정 전에 해야 얼룩이 안 남음). */
+    /**
+     * 마스크 자리를 주변 종이색으로 메우고, 바로 옆 그림자를 밝힌다(조명 보정 전에 해야 얼룩이 안 남음).
+     * 손가락 자리와 책 바깥(곡면 편 결과의 가장자리)에 쓴다. 새 Mat 반환.
+     * 큰 페이지에서도 메모리를 적게 쓰도록 원본 해상도 계산은 채널 하나씩 한다.
+     */
     private fun fillPaper(img: Mat, mask: Mat): Mat {
         val h = img.rows()
         val w = img.cols()
@@ -658,7 +662,7 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         Imgproc.resize(mask, m, ss, 0.0, 0.0, Imgproc.INTER_NEAREST)
         val longSide = max(ss.width, ss.height)
 
-        // 글자를 지운 '종이 배경' → 손가락 밖 종이만으로 가중 평균(정규화 컨볼루션)해 종이색 추정
+        // 글자를 지운 '종이 배경' → 마스크 밖 종이만으로 가중 평균(정규화 컨볼루션)해 종이색 추정
         val k = max(9, (longSide * 0.03).toInt()) or 1
         val paper = Mat()
         Imgproc.morphologyEx(small, paper, Imgproc.MORPH_CLOSE, ellipse(k))
@@ -672,13 +676,13 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         val paperF = Mat()
         paper.convertTo(paperF, CvType.CV_32FC3)
         val num = Mat()
-        Core.multiply(paperF, merge3(valid), num)
+        merge3(valid).also { v3 -> Core.multiply(paperF, v3, num); v3.release() }
         Imgproc.GaussianBlur(num, num, Size(0.0, 0.0), sig)
         val den = Mat()
         Imgproc.GaussianBlur(valid, den, Size(0.0, 0.0), sig)
         Core.max(den, Scalar(1e-3), den)
         val ref = Mat()
-        Core.divide(num, merge3(den), ref)
+        merge3(den).also { d3 -> Core.divide(num, d3, ref); d3.release() }
 
         // 그림자 밝히기: 글자만 지운(작은 커널) 종이 밝기를 기준 종이 밝기로 끌어올리는 배율
         val paperS = Mat()
@@ -704,32 +708,36 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         Core.multiply(g, ringF, g)
         Core.add(g, Scalar(1.0), g)
 
-        // 원본 해상도에서는 손가락 주변 영역만 처리
+        // 원본 해상도에서는 마스크 주변 영역만, 채널 하나씩: out = (img*(1-soft) + ref*soft) * g
         val roiS = expand(Imgproc.boundingRect(ring8), 10, ss)
         val roiF = toFull(roiS, s, w, h)
         val out = img.clone()
-        val imgRoi = Mat()
-        img.submat(roiF).convertTo(imgRoi, CvType.CV_32FC3)
-        val refUp = Mat()
-        Imgproc.resize(ref.submat(roiS), refUp, roiF.size(), 0.0, 0.0, Imgproc.INTER_CUBIC)
         val gUp = Mat()
-        Imgproc.resize(g.submat(roiS), gUp, roiF.size(), 0.0, 0.0, Imgproc.INTER_LINEAR)
+        g.withRoi(roiS) { Imgproc.resize(it, gUp, roiF.size(), 0.0, 0.0, Imgproc.INTER_LINEAR) }
         val soft = Mat()
-        Imgproc.GaussianBlur(mask.submat(roiF), soft, Size(0.0, 0.0), 4.0)
+        mask.withRoi(roiF) { Imgproc.GaussianBlur(it, soft, Size(0.0, 0.0), 4.0) }
         soft.convertTo(soft, CvType.CV_32F, 1.0 / 255.0)
-
-        // out = (img*(1-soft) + ref*soft) * g
-        val diff = Mat()
-        Core.subtract(refUp, imgRoi, diff)
-        Core.multiply(diff, merge3(soft), diff)
-        Core.add(imgRoi, diff, imgRoi)
-        Core.multiply(imgRoi, merge3(gUp), imgRoi)
-        val roi8 = Mat()
-        imgRoi.convertTo(roi8, CvType.CV_8UC3)
-        roi8.copyTo(out.submat(roiF))
-
+        val refCh = ArrayList<Mat>()
+        Core.split(ref, refCh)
+        val imgC = Mat()
+        val refUp = Mat()
+        val tmp = Mat()
+        out.withRoi(roiF) { outRoi ->
+            for (c in 0 until 3) {
+                Core.extractChannel(outRoi, imgC, c)
+                imgC.convertTo(imgC, CvType.CV_32F)
+                refCh[c].withRoi(roiS) { Imgproc.resize(it, refUp, roiF.size(), 0.0, 0.0, Imgproc.INTER_CUBIC) }
+                Core.subtract(refUp, imgC, tmp)
+                Core.multiply(tmp, soft, tmp)
+                Core.add(imgC, tmp, imgC)
+                Core.multiply(imgC, gUp, imgC)
+                imgC.convertTo(tmp, CvType.CV_8U)
+                Core.insertChannel(tmp, outRoi, c)
+            }
+        }
+        refCh.forEach { it.release() }
         listOf(small, m, paper, dil, valid8, valid, paperF, num, den, ref, paperS, paperSF, lumRef, lumP, gain,
-            ring8, ringF, g, imgRoi, refUp, gUp, soft, diff, roi8).forEach { it.release() }
+            ring8, ringF, g, gUp, soft, imgC, refUp, tmp).forEach { it.release() }
         return out
     }
 
@@ -758,47 +766,157 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         return out
     }
 
-    private fun finish(norm: Mat, mode: ColorMode): Mat {
-        if (mode == ColorMode.BW) {
-            val g = Mat()
-            Imgproc.cvtColor(norm, g, Imgproc.COLOR_RGB2GRAY)
-            Imgproc.GaussianBlur(g, g, Size(0.0, 0.0), 0.8)
-            val bw = Mat()
-            Imgproc.adaptiveThreshold(g, bw, 255.0, Imgproc.ADAPTIVE_THRESH_GAUSSIAN_C, Imgproc.THRESH_BINARY, 31, 12.0)
-            // 뒷면 비침(종이보다 조금만 어두운 흐린 글씨)은 검게 찍지 않음
-            val ghost = Mat()
-            Imgproc.threshold(g, ghost, BW_GHOST - 1.0, 255.0, Imgproc.THRESH_BINARY)
-            bw.setTo(Scalar(255.0), ghost)
-            ghost.release()
-            g.release()
-            return bw
+    /**
+     * 조명 평탄화된 8비트 이미지 → 종이는 흰색, 글자는 원래 모양(가장자리의 부드러운 회색 포함) 그대로 진하게.
+     * 글자를 이진화하듯 깎지 않는다(획이 끊기거나 얇아지거나 얼룩덜룩해지지 않게).
+     *  - 흰색 기준을 자리마다 다르게: 진한 글자·긴 선·색 있는 곳 근처는 높게(가장자리 보존),
+     *    그 밖은 낮게(뒷면에서 비치는 글씨와 종이 얼룩은 흰색으로)
+     *  - 밝기만 바꾸고 색은 같은 비율로 유지(색 상자·그림 보존)
+     * 입력이 RGB 면 RGB, 1채널이면 1채널(8비트)을 돌려준다. 메모리를 아끼려 큰 계산은 1채널로.
+     */
+    private fun toneMap(norm: Mat): Mat {
+        val color = norm.channels() == 3
+        val h = norm.rows()
+        val w = norm.cols()
+        val g8 = Mat()
+        if (color) Imgproc.cvtColor(norm, g8, Imgproc.COLOR_RGB2GRAY) else norm.copyTo(g8)
+        // 종이 밝기·검정 기준 (긴 변 1000px)
+        val s = min(1.0, 1000.0 / max(h, w))
+        val gsM = Mat()
+        if (s < 1.0) Imgproc.resize(g8, gsM, Size(0.0, 0.0), s, s, Imgproc.INTER_AREA) else g8.copyTo(gsM)
+        val gs = ByteArray((gsM.total()).toInt()).also { gsM.get(0, 0, it) }
+        gsM.release()
+        val paper = percentileByHistogram(gs, PAPER_PCT)
+        val coreThr = paper * INK_DARK
+        val core = gs.filter { (it.toInt() and 0xFF) < coreThr }.toByteArray()
+        var black = if (core.size > 100) percentileByHistogram(core, BLACK_INK_PCT) else percentileByHistogram(gs, 1.0)
+        black = min(black, paper * WHITE_BG - 40.0)
+
+        // 글자 근처 지도: 진한 글자 심 주변 + 긴 선(상자 테두리·밑줄) + 색 있는 곳
+        val ink = Mat()
+        Imgproc.threshold(g8, ink, ceil(paper * INK_DARK) - 1.0, 255.0, Imgproc.THRESH_BINARY_INV) // g < paper*INK_DARK
+        val faint = Mat()
+        Imgproc.threshold(g8, faint, ceil(paper * LINE_FAINT) - 1.0, 255.0, Imgproc.THRESH_BINARY_INV)
+        val ll = max(9, (w * 0.03).toInt())
+        val lines = Mat()
+        val tmp8 = Mat()
+        Imgproc.morphologyEx(faint, lines, Imgproc.MORPH_OPEN, rectK(ll, 1))
+        Imgproc.morphologyEx(faint, tmp8, Imgproc.MORPH_OPEN, rectK(1, ll))
+        Core.bitwise_or(lines, tmp8, lines)
+        faint.release()
+        val r = max(2, (w * INK_NEAR).toInt())
+        val keep = Mat()
+        Imgproc.dilate(ink, keep, ellipse(2 * r + 1))
+        ink.release()
+        Imgproc.dilate(lines, tmp8, ellipse(5))
+        lines.release()
+        Core.bitwise_or(keep, tmp8, keep)
+        if (color) {
+            val lab = Mat()
+            Imgproc.cvtColor(norm, lab, Imgproc.COLOR_RGB2Lab)
+            val ch = ArrayList<Mat>()
+            Core.split(lab, ch)
+            lab.release()
+            val aF = Mat()
+            val bF = Mat()
+            ch[1].convertTo(aF, CvType.CV_32F, 1.0, -128.0)
+            ch[2].convertTo(bF, CvType.CV_32F, 1.0, -128.0)
+            ch.forEach { it.release() }
+            Core.magnitude(aF, bF, aF)
+            bF.release()
+            Imgproc.GaussianBlur(aF, aF, Size(0.0, 0.0), 2.0)
+            Imgproc.threshold(aF, aF, CHROMA_KEEP, 255.0, Imgproc.THRESH_BINARY)
+            aF.convertTo(tmp8, CvType.CV_8U)
+            aF.release()
+            Core.bitwise_or(keep, tmp8, keep)
         }
-        val x = if (mode == ColorMode.COLOR) norm.clone() else Mat().also { Imgproc.cvtColor(norm, it, Imgproc.COLOR_RGB2GRAY) }
-        // 레벨: 종이는 완전 흰색, 글자는 더 진하게
-        val small = Mat()
-        val s = min(1.0, 1000.0 / max(x.rows(), x.cols()))
-        Imgproc.resize(x, small, Size(), s, s, Imgproc.INTER_AREA)
-        val sb = ByteArray((small.total() * small.channels()).toInt())
-        small.get(0, 0, sb)
-        small.release()
-        val hi = WHITE_POINT // 흰색 기준을 낮춰 뒷면 비침(밝기 200~235)도 지움
-        val lo = min(percentileByHistogram(sb, 1.0), hi - 1.0) // 거의 빈 페이지에서 0으로 나누지 않게
-        val lutBytes = ByteArray(256) { v ->
-            val t = ((v - lo) / max(hi - lo, 1.0)).coerceIn(0.0, 1.0)
-            (t.pow(TONE_GAMMA) * 255.0).roundToInt().coerceIn(0, 255).toByte() // 감마>1: 옅은 글씨를 진하게
-        }
-        val lut = Mat(1, 256, CvType.CV_8UC1)
-        lut.put(0, 0, lutBytes)
-        val y = Mat()
-        Core.LUT(x, lut, y)
-        x.release(); lut.release()
-        // 언샤프 마스크
-        val blur = Mat()
-        Imgproc.GaussianBlur(y, blur, Size(0.0, 0.0), 1.2)
+        // near(0~1) → 흰색 기준 white = paper*(WB + (WT-WB)*near) → white - black (최소 1)
+        val wv = Mat()
+        keep.convertTo(wv, CvType.CV_32F, 1.0 / 255.0)
+        keep.release()
+        Imgproc.GaussianBlur(wv, wv, Size(0.0, 0.0), max(1.0, r / 2.0))
+        wv.convertTo(wv, CvType.CV_32F, paper * (WHITE_TEXT - WHITE_BG), paper * WHITE_BG - black)
+        Core.max(wv, Scalar(1.0), wv)
+        // t = clip((g - black) / (white - black), 0, 1)
+        val gF = Mat()
+        g8.convertTo(gF, CvType.CV_32F)
+        g8.release()
+        val t = Mat()
+        Core.subtract(gF, Scalar(black), t)
+        Core.divide(t, wv, t)
+        wv.release()
+        Core.max(t, Scalar(0.0), t)
+        Core.min(t, Scalar(1.0), t)
+        val white = Mat()
+        Imgproc.threshold(t, white, 0.999999, 255.0, Imgproc.THRESH_BINARY) // t >= 1
+        val white8 = Mat()
+        white.convertTo(white8, CvType.CV_8U)
+        white.release()
+        // y = BLACK_OUT + (255 - BLACK_OUT) * t^gamma
+        Core.pow(t, TONE_GAMMA, t)
+        t.convertTo(t, CvType.CV_32F, 255.0 - BLACK_OUT, BLACK_OUT)
         val out = Mat()
-        Core.addWeighted(y, 1.6, blur, -0.6, 0.0, out)
-        y.release(); blur.release()
+        if (color) {
+            // 채널마다 같은 비율(y / g)로 → 색 유지
+            Core.max(gF, Scalar(1.0), gF)
+            Core.divide(t, gF, t)
+            norm.copyTo(out)
+            val cF = Mat()
+            for (c in 0 until 3) {
+                Core.extractChannel(norm, tmp8, c)
+                tmp8.convertTo(cF, CvType.CV_32F)
+                Core.multiply(cF, t, cF)
+                cF.convertTo(tmp8, CvType.CV_8U)
+                Core.insertChannel(tmp8, out, c)
+            }
+            cF.release()
+            out.setTo(Scalar(255.0, 255.0, 255.0), white8)
+        } else {
+            t.convertTo(out, CvType.CV_8U)
+        }
+        gF.release(); t.release(); white8.release(); tmp8.release()
+        if (SHARPEN > 0) {
+            val bl = Mat()
+            Imgproc.GaussianBlur(out, bl, Size(0.0, 0.0), SHARPEN_SIGMA)
+            Core.addWeighted(out, 1.0 + SHARPEN, bl, -SHARPEN, 0.0, out)
+            bl.release()
+        }
         return out
+    }
+
+    private fun finish(norm: Mat, mode: ColorMode): Mat {
+        if (mode == ColorMode.COLOR) return toneMap(norm)
+        val g = Mat()
+        Imgproc.cvtColor(norm, g, Imgproc.COLOR_RGB2GRAY)
+        val y = toneMap(g)
+        g.release()
+        if (mode == ColorMode.GRAY) return y
+        // 흑백: 조명이 이미 고르게 펴졌으므로 한 기준으로 자른다(적응형 이진화는 흐린 획을 끊어 먹음).
+        // 해상도가 낮으면 2배로 키워 자른 뒤 되돌려 글자 가장자리가 계단지지 않게.
+        val w = y.cols()
+        val h = y.rows()
+        val bw = Mat()
+        if (w < BW_UPSCALE_BELOW) {
+            val up = Mat()
+            y.convertTo(up, CvType.CV_32F)
+            Imgproc.resize(up, up, Size(w * 2.0, h * 2.0), 0.0, 0.0, Imgproc.INTER_CUBIC)
+            Imgproc.GaussianBlur(up, up, Size(0.0, 0.0), 1.0)
+            Imgproc.threshold(up, up, BW_T - 1e-3, 255.0, Imgproc.THRESH_BINARY) // up >= BW_T → 흰색
+            val up8 = Mat()
+            up.convertTo(up8, CvType.CV_8U)
+            up.release()
+            Imgproc.resize(up8, bw, Size(w.toDouble(), h.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
+            up8.release()
+        } else {
+            val yf = Mat()
+            y.convertTo(yf, CvType.CV_32F)
+            Imgproc.GaussianBlur(yf, yf, Size(0.0, 0.0), 0.7)
+            Imgproc.threshold(yf, yf, BW_T - 1e-3, 255.0, Imgproc.THRESH_BINARY)
+            yf.convertTo(bw, CvType.CV_8U)
+            yf.release()
+        }
+        y.release()
+        return bw
     }
 
     /**
@@ -921,7 +1039,10 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         full.release()
     }
 
-    /** 손가락 영역을 흰색으로 채우고(경계는 부드럽게), 주변의 옅은 그림자·테두리도 정리. out 을 직접 수정. */
+    /**
+     * 손가락 영역을 흰색으로 채우고(경계는 부드럽게), 주변 띠에 남은 옅은 그림자·테두리도 흰색으로.
+     * 띠에서는 ERASE_LIGHT 보다 밝은 것만 밀어내므로 글자(가장자리의 회색 포함)는 남는다. out 을 직접 수정.
+     */
     private fun erase(out: Mat, mask: Mat) {
         val h = mask.rows()
         val w = mask.cols()
@@ -937,42 +1058,68 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         val roiF = toFull(roiS, s, w, h)
 
         val ring = Mat()
-        Imgproc.resize(ringS.submat(roiS), ring, roiF.size(), 0.0, 0.0, Imgproc.INTER_LINEAR)
+        ringS.withRoi(roiS) { Imgproc.resize(it, ring, roiF.size(), 0.0, 0.0, Imgproc.INTER_LINEAR) }
         ring.convertTo(ring, CvType.CV_32F, 1.0 / 255.0)
         val soft = Mat()
-        Imgproc.GaussianBlur(mask.submat(roiF), soft, Size(0.0, 0.0), 3.0)
+        mask.withRoi(roiF) { Imgproc.GaussianBlur(it, soft, Size(0.0, 0.0), 3.0) }
         soft.convertTo(soft, CvType.CV_32F, 1.0 / 255.0)
 
-        val outRoi = out.submat(roiF)
-        val lum = Mat()
-        if (out.channels() == 3) Imgproc.cvtColor(outRoi, lum, Imgproc.COLOR_RGB2GRAY) else outRoi.copyTo(lum)
-        lum.convertTo(lum, CvType.CV_32F)
-        // light = clip((lum - 150) / 60, 0, 1) * ring
-        val light = Mat()
-        Core.subtract(lum, Scalar(150.0), light)
-        Core.multiply(light, Scalar(1.0 / 60.0), light)
-        Core.max(light, Scalar(0.0), light)
-        Core.min(light, Scalar(1.0), light)
-        Core.multiply(light, ring, light)
-        val wgt = Mat()
-        Core.max(soft, light, wgt)
-
-        // out = out + (255 - out) * wgt
+        val tmp = Mat()
         val f = Mat()
-        outRoi.convertTo(f, if (out.channels() == 3) CvType.CV_32FC3 else CvType.CV_32F)
-        val inv = Mat()
-        Core.subtract(Mat(f.size(), f.type(), Scalar.all(255.0)), f, inv)
-        Core.multiply(inv, if (out.channels() == 3) merge3(wgt) else wgt, inv)
-        Core.add(f, inv, f)
-        val back = Mat()
-        f.convertTo(back, out.type())
-        back.copyTo(outRoi)
-        listOf(mS, ringS, ring, soft, lum, light, wgt, f, inv, back).forEach { it.release() }
+        out.withRoi(roiF) { outRoi ->
+            val lum = Mat()
+            if (out.channels() == 3) Imgproc.cvtColor(outRoi, lum, Imgproc.COLOR_RGB2GRAY) else outRoi.copyTo(lum)
+            // light = clip((lum - ERASE_LIGHT) / 40, 0, 1) * ring ;  wgt = max(soft, light)
+            lum.convertTo(lum, CvType.CV_32F, 1.0 / 40.0, -ERASE_LIGHT / 40.0)
+            Core.max(lum, Scalar(0.0), lum)
+            Core.min(lum, Scalar(1.0), lum)
+            Core.multiply(lum, ring, lum)
+            Core.max(soft, lum, lum)
+            // out = out + (255 - out) * wgt, 채널 하나씩
+            for (c in 0 until out.channels()) {
+                if (out.channels() == 3) Core.extractChannel(outRoi, tmp, c) else outRoi.copyTo(tmp)
+                tmp.convertTo(f, CvType.CV_32F)
+                f.convertTo(f, CvType.CV_32F, -1.0, 255.0)   // 255 - out
+                Core.multiply(f, lum, f)
+                val o = Mat()
+                tmp.convertTo(o, CvType.CV_32F)
+                Core.add(o, f, o)
+                o.convertTo(tmp, CvType.CV_8U)
+                o.release()
+                if (out.channels() == 3) Core.insertChannel(tmp, outRoi, c) else tmp.copyTo(outRoi)
+            }
+            lum.release()
+        }
+        listOf(mS, ringS, ring, soft, tmp, f).forEach { it.release() }
     }
 
     // ================================================================= 유틸
 
     private fun ellipse(k: Int): Mat = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, Size(k.toDouble(), k.toDouble()))
+
+    private fun rectK(w: Int, h: Int): Mat = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(w.toDouble(), h.toDouble()))
+
+    /** 부분 영역의 독립 복사본. submat 헤더를 바로 해제해 큰 부모 버퍼가 붙잡히지 않게 */
+    private fun Mat.cropClone(r: Rect): Mat {
+        val v = submat(r)
+        try {
+            return v.clone()
+        } finally {
+            v.release()
+        }
+    }
+
+    private fun Mat.cropClone(r0: Int, r1: Int, c0: Int, c1: Int): Mat = cropClone(Rect(c0, r0, c1 - c0, r1 - r0))
+
+    /** 부분 영역 보기(같은 버퍼)로 작업한 뒤 보기 헤더를 해제 */
+    private inline fun <T> Mat.withRoi(r: Rect, f: (Mat) -> T): T {
+        val v = submat(r)
+        try {
+            return f(v)
+        } finally {
+            v.release()
+        }
+    }
 
     private fun merge3(m: Mat): Mat {
         val out = Mat()
@@ -1018,14 +1165,22 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         /** 처리 해상도 상한(긴 변). 카메라 원본(4000x3000)을 그대로 써서 양면을 나눠도 글씨가 또렷하게 */
         const val MAX_SIDE = 4000
 
-        /** 이보다 밝으면 흰 종이로(뒷면 비침 제거) */
-        const val WHITE_POINT = 220.0
-
-        /** 1보다 크면 중간 밝기(옅은 글씨)를 진하게 */
-        const val TONE_GAMMA = 2.0
-
-        /** 흑백 모드에서 이보다 밝은 것은 글자로 보지 않음 */
-        const val BW_GHOST = 185.0
+        // ---- 화질 보정(톤): engine/bookscan.py 의 같은 이름 상수
+        const val PAPER_PCT = 60.0      // 종이 밝기 = 조명 평탄화 후 밝기의 이 백분위
+        const val WHITE_TEXT = 0.96     // 글자 근처의 흰색 기준(종이 밝기 대비): 글자 가장자리의 부드러운 회색을 살림
+        const val WHITE_BG = 0.83       // 글자에서 떨어진 곳의 흰색 기준: 뒷면 비침·종이 결을 지움
+        const val INK_DARK = 0.62       // 종이 밝기의 이 배보다 어두우면 확실한 글자(인쇄 잉크)
+        const val LINE_FAINT = 0.95     // 상자 테두리·밑줄처럼 긴 선은 옅어도 살림
+        const val INK_NEAR = 0.006      // 글자 근처로 보는 거리(페이지 폭 비율)
+        const val CHROMA_KEEP = 14.0    // 이보다 색이 진하면(색 상자·그림) 살림
+        const val BLACK_INK_PCT = 25.0  // 글자 픽셀 밝기의 이 백분위를 완전한 검정으로
+        const val BLACK_OUT = 12.0      // 검정이 놓일 값 (0으로 몰면 글자 가장자리가 뭉개짐)
+        const val TONE_GAMMA = 1.25     // 1보다 크면 중간 밝기(옅은 글씨·글자 가장자리)를 조금 진하게
+        const val SHARPEN = 0.3         // 언샤프 마스크 세기 (너무 세면 글자가 얼룩덜룩해짐)
+        const val SHARPEN_SIGMA = 1.0
+        const val BW_T = 200.0          // 흑백 모드: 톤 보정 후 이보다 어두우면 검정
+        const val BW_UPSCALE_BELOW = 1600 // 흑백 모드: 페이지 폭이 이보다 작으면 2배로 키워서 자름
+        const val ERASE_LIGHT = 200.0   // 손가락 주변 띠에서 이보다 밝은 것(남은 옅은 그림자)만 흰색으로
 
         /** 글줄 분석 해상도(긴 변) */
         const val ANALYSIS_SIDE = 1600.0

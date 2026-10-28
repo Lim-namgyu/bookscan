@@ -35,6 +35,7 @@ class BookRegion(modelBytes: ByteArray) : AutoCloseable {
         }
     )
     private val inputName: String = session.inputNames.first()
+    private val outputName: String = session.outputNames.first() // 합쳐진 최종 지도(나머지 6개는 중간 단계)
 
     override fun close() {
         session.close()
@@ -59,7 +60,7 @@ class BookRegion(modelBytes: ByteArray) : AutoCloseable {
         }
         val out = FloatArray(plane)
         OnnxTensor.createTensor(env, FloatBuffer.wrap(arr), longArrayOf(1, 3, SIZE.toLong(), SIZE.toLong())).use { t ->
-            session.run(mapOf(inputName to t)).use { res ->
+            session.run(mapOf(inputName to t), setOf(outputName)).use { res ->
                 (res.get(0) as OnnxTensor).floatBuffer.get(out)
             }
         }

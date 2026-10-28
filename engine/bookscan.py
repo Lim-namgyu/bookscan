@@ -621,31 +621,87 @@ def flatten_illumination(img):
     return np.clip(out, 0, 255)
 
 
-WHITE_POINT = 220.0  # 이보다 밝으면 흰 종이로(뒷면 비침 제거)
-TONE_GAMMA = 2.0     # 1보다 크면 중간 밝기(옅은 글씨)를 진하게
-BW_GHOST = 185       # 흑백 모드에서 이보다 밝은 것은 글자로 보지 않음
+PAPER_PCT = 60        # 종이 밝기 = 조명 평탄화 후 밝기의 이 백분위
+WHITE_TEXT = 0.96     # 글자 근처의 흰색 기준(종이 밝기 대비): 글자 가장자리의 부드러운 회색을 살림
+WHITE_BG = 0.83       # 글자에서 떨어진 곳의 흰색 기준: 뒷면 비침·종이 결을 지움
+INK_DARK = 0.62       # 종이 밝기의 이 배보다 어두우면 확실한 글자(인쇄 잉크)
+LINE_FAINT = 0.95     # 상자 테두리·밑줄처럼 긴 선은 옅어도 살림
+INK_NEAR = 0.006      # 글자 근처로 보는 거리(페이지 폭 비율)
+CHROMA_KEEP = 14.0    # 이보다 색이 진하면(색 상자·그림) 살림
+BLACK_INK_PCT = 25.0  # 글자 픽셀 밝기의 이 백분위를 완전한 검정으로
+BLACK_OUT = 12.0      # 검정이 놓일 값 (0으로 몰면 글자 가장자리가 뭉개짐)
+TONE_GAMMA = 1.25     # 1보다 크면 중간 밝기(옅은 글씨·글자 가장자리)를 조금 진하게
+SHARPEN = 0.3         # 언샤프 마스크 세기 (너무 세면 글자가 얼룩덜룩해짐)
+SHARPEN_SIGMA = 1.0
+BW_T = 200            # 흑백 모드: 톤 보정 후 이보다 어두우면 검정
+BW_UPSCALE_BELOW = 1600  # 흑백 모드: 페이지 폭이 이보다 작으면 2배로 키워서 자름
+
+
+def tone_map(norm):
+    """
+    조명 평탄화된 float 이미지 → 종이는 흰색, 글자는 원래 모양(가장자리의 부드러운 회색 포함) 그대로 진하게.
+    글자를 이진화하듯 깎지 않는다(획이 끊기거나 얇아지거나 얼룩덜룩해지지 않게).
+      - 흰색 기준을 자리마다 다르게: 진한 글자·긴 선·색 있는 곳 근처는 높게(가장자리 보존),
+        그 밖은 낮게(뒷면에서 비치는 글씨와 종이 얼룩은 흰색으로)
+      - 밝기만 바꾸고 색은 같은 비율로 유지(색 상자·그림 보존)
+    """
+    color = norm.ndim == 3
+    n8 = np.clip(norm, 0, 255).astype(np.uint8)
+    g = cv2.cvtColor(n8, cv2.COLOR_BGR2GRAY).astype(np.float32) if color else n8.astype(np.float32)
+    h, w = g.shape
+    s = min(1.0, 1000.0 / max(h, w))
+    gs = cv2.resize(g, None, fx=s, fy=s, interpolation=cv2.INTER_AREA) if s < 1 else g
+    paper = float(np.percentile(gs, PAPER_PCT))
+    core = gs[gs < paper * INK_DARK]
+    black = float(np.percentile(core, BLACK_INK_PCT)) if core.size > 100 else float(np.percentile(gs, 1.0))
+    black = min(black, paper * WHITE_BG - 40.0)
+    # 글자 근처 지도
+    ink = (g < paper * INK_DARK).astype(np.uint8)
+    faint = (g < paper * LINE_FAINT).astype(np.uint8)
+    L = max(9, int(w * 0.03))
+    lines = cv2.morphologyEx(faint, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (L, 1))) | \
+        cv2.morphologyEx(faint, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, L)))
+    r = max(2, int(w * INK_NEAR))
+    keep = cv2.dilate(ink, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))) | \
+        cv2.dilate(lines, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    if color:
+        lab = cv2.cvtColor(n8, cv2.COLOR_BGR2LAB).astype(np.float32)
+        chroma = np.hypot(lab[..., 1] - 128, lab[..., 2] - 128)
+        keep |= (cv2.GaussianBlur(chroma, (0, 0), 2) > CHROMA_KEEP).astype(np.uint8)
+    near = cv2.GaussianBlur(keep.astype(np.float32), (0, 0), max(1.0, r / 2.0))
+    white = paper * (WHITE_BG + (WHITE_TEXT - WHITE_BG) * near)
+    t = np.clip((g - black) / np.maximum(white - black, 1.0), 0, 1)
+    y = BLACK_OUT + (255.0 - BLACK_OUT) * t ** TONE_GAMMA
+    if color:
+        out = norm * (y / np.maximum(g, 1.0))[..., None]
+        out[t >= 1] = 255.0
+    else:
+        out = y
+    if SHARPEN > 0:
+        bl = cv2.GaussianBlur(out, (0, 0), SHARPEN_SIGMA)
+        out = out * (1 + SHARPEN) - bl * SHARPEN
+    return np.clip(out, 0, 255).astype(np.uint8)
 
 
 def finish(norm, mode="color"):
     """norm: 조명 평탄화된 float 이미지. mode: color / gray / bw"""
-    if mode == "bw":
-        g = cv2.cvtColor(norm.astype(np.uint8), cv2.COLOR_BGR2GRAY)
-        g = cv2.GaussianBlur(g, (0, 0), 0.8)
-        bw = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 12)
-        # 뒷면 비침(종이보다 조금만 어두운 흐린 글씨)은 검게 찍지 않음
-        bw[g >= BW_GHOST] = 255
-        return bw
-    x = norm if mode == "color" else cv2.cvtColor(norm.astype(np.uint8), cv2.COLOR_BGR2GRAY).astype(np.float32)
-    # 레벨: 종이(상위)는 완전 흰색, 글자는 더 진하게. 흰색 기준을 낮춰 뒷면 비침(밝기 200~235)도 지움
-    lo = np.percentile(x, 1.0)
-    hi = WHITE_POINT
-    lo = min(lo, hi - 1.0)  # 거의 빈 페이지(전부 밝음)에서 0으로 나누지 않게
-    x = np.clip((x - lo) / max(hi - lo, 1.0), 0, 1)
-    x = x ** TONE_GAMMA * 255.0
-    # 언샤프 마스크
-    blur = cv2.GaussianBlur(x, (0, 0), 1.2)
-    x = cv2.addWeighted(x, 1.6, blur, -0.6, 0)
-    return np.clip(x, 0, 255).astype(np.uint8)
+    if mode == "color":
+        return tone_map(norm)
+    g = cv2.cvtColor(np.clip(norm, 0, 255).astype(np.uint8), cv2.COLOR_BGR2GRAY).astype(np.float32)
+    y = tone_map(g)
+    if mode == "gray":
+        return y
+    # 흑백: 조명이 이미 고르게 펴졌으므로 한 기준으로 자른다(적응형 이진화는 흐린 획을 끊어 먹음).
+    # 해상도가 낮으면 2배로 키워 자른 뒤 되돌려 글자 가장자리가 계단지지 않게.
+    yf = y.astype(np.float32)
+    h, w = yf.shape
+    if w < BW_UPSCALE_BELOW:
+        up = cv2.resize(yf, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
+        up = cv2.GaussianBlur(up, (0, 0), 1.0)
+        bw = np.where(up < BW_T, 0, 255).astype(np.uint8)
+        return cv2.resize(bw, (w, h), interpolation=cv2.INTER_AREA)
+    yf = cv2.GaussianBlur(yf, (0, 0), 0.7)
+    return np.where(yf < BW_T, 0, 255).astype(np.uint8)
 
 
 def clean_edges(out, gutter_side=None):
@@ -710,6 +766,9 @@ EDGE_BAND = 0.04
 EDGE_GUTTER = 0.06
 
 
+ERASE_LIGHT = 200  # 손가락 주변 띠에서 이보다 밝은 것(남은 옅은 그림자)만 흰색으로. 글자 가장자리 회색은 보존
+
+
 def erase(out, mask):
     """손가락 영역을 종이색(흰색)으로 채우되 경계는 부드럽게."""
     if not mask.any():
@@ -721,7 +780,7 @@ def erase(out, mask):
     ring = cv2.GaussianBlur(cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d, d))), (0, 0), 6)
     ring = ring.astype(np.float32) / 255.0
     lum = out if out.ndim == 2 else cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)
-    light = np.clip((lum.astype(np.float32) - 150) / 60, 0, 1) * ring
+    light = np.clip((lum.astype(np.float32) - ERASE_LIGHT) / 40, 0, 1) * ring
     wgt = np.maximum(soft, light)
     if out.ndim == 3:
         wgt = wgt[..., None]

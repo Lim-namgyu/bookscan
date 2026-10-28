@@ -20,8 +20,9 @@ class BookRegion:
 
     def saliency(self, img):
         """0~1 확률 지도 (SAL_SIZE x SAL_SIZE)"""
-        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32)
-        x = cv2.resize(rgb, (SAL_SIZE, SAL_SIZE), interpolation=cv2.INTER_AREA)
+        # 8비트 그대로 줄인 뒤 실수로 (큰 사진 전체를 실수로 바꾸지 않음 — 앱과 같은 순서)
+        small = cv2.resize(img, (SAL_SIZE, SAL_SIZE), interpolation=cv2.INTER_AREA)
+        x = cv2.cvtColor(small, cv2.COLOR_BGR2RGB).astype(np.float32)
         x = x / max(float(x.max()), 1e-6)
         x = (x - MEAN) / STD
         o = self.sess.run(None, {self.inp: x.transpose(2, 0, 1)[None].astype(np.float32)})[0][0, 0]
