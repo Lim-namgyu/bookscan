@@ -32,6 +32,8 @@ jobs:
       - name: 파이썬 기준 구현 실행
         run: |
           python3 engine/bookscan.py --out py_out engine/testdata/*.jpg
+          python3 engine/bookscan.py --out py_out_bw --mode bw engine/testdata/workbook_spread.jpg
+          python3 engine/bookscan.py --out py_out_gray --mode gray engine/testdata/cook_single.jpg
 
       - uses: actions/setup-java@v4
         with:
@@ -46,13 +48,18 @@ jobs:
           chmod +x gradlew
           ./gradlew --no-daemon --quiet installDist
           build/install/enginetest/bin/enginetest ../BookScan/app/src/main/assets ../../kt_out ../../engine/testdata/*.jpg 2>&1 | tee ../../kt_log.txt
+          MODE=BW build/install/enginetest/bin/enginetest ../BookScan/app/src/main/assets ../../kt_out_bw ../../engine/testdata/workbook_spread.jpg 2>&1 | tee -a ../../kt_log.txt
+          MODE=GRAY build/install/enginetest/bin/enginetest ../BookScan/app/src/main/assets ../../kt_out_gray ../../engine/testdata/cook_single.jpg 2>&1 | tee -a ../../kt_log.txt
 
       - name: 결과 비교
-        run: python3 engine/compare_outputs.py py_out kt_out | tee compare.txt
+        run: |
+          python3 engine/compare_outputs.py py_out kt_out | tee compare.txt
+          python3 engine/compare_outputs.py py_out_bw kt_out_bw | tee -a compare.txt
+          python3 engine/compare_outputs.py py_out_gray kt_out_gray | tee -a compare.txt
 
       - name: 결과 묶기
         if: always()
-        run: zip -qr engine-outputs-${{ github.run_number }}.zip py_out kt_out kt_log.txt compare.txt
+        run: zip -qr engine-outputs-${{ github.run_number }}.zip py_out* kt_out* kt_log.txt compare.txt
 
       - uses: actions/upload-artifact@v4
         if: always()
