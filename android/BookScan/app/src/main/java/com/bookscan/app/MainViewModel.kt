@@ -58,6 +58,16 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
     var colorMode by mutableStateOf(ColorMode.COLOR)
     var removeFingers by mutableStateOf(true)
     var autoCapture by mutableStateOf(false)
+
+    // 촬영음(작은 틱 소리) 켜기/끄기 — 앱을 다시 켜도 유지
+    private val prefs = app.getSharedPreferences("bookscan", android.content.Context.MODE_PRIVATE)
+    var shutterSound by mutableStateOf(prefs.getBoolean("shutterSound", true))
+        private set
+
+    fun setShutterSoundOn(on: Boolean) {
+        shutterSound = on
+        prefs.edit().putBoolean("shutterSound", on).apply()
+    }
     var processing by mutableIntStateOf(0)
         private set
     var message by mutableStateOf<String?>(null)

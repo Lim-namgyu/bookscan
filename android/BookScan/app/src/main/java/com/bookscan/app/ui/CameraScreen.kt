@@ -9,7 +9,6 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
-import android.media.MediaActionSound
 import android.view.OrientationEventListener
 import android.view.Surface
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -48,6 +47,8 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.VolumeOff
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.Autorenew
 import androidx.compose.material.icons.filled.FlashOff
 import androidx.compose.material.icons.filled.FlashOn
@@ -86,6 +87,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.bookscan.app.MainViewModel
 import com.bookscan.app.camera.CaptureReadiness
+import com.bookscan.app.camera.ShutterFeedback
 import com.bookscan.app.engine.BookRegion
 import com.bookscan.app.engine.ColorMode
 import com.bookscan.app.engine.Layout
@@ -150,7 +152,9 @@ private fun CameraContent(vm: MainViewModel, onOpenReview: () -> Unit) {
         }
     }
     val captureExecutor = remember { Executors.newSingleThreadExecutor() }
-    val sound = remember { MediaActionSound().apply { load(MediaActionSound.SHUTTER_CLICK) } }
+    // 촬영 피드백: 짧은 진동 + 작은 틱 소리 (시스템 셔터음은 너무 크고 줄일 수 없음)
+    val sound = remember { ShutterFeedback(ctx) }
+    LaunchedEffect(vm.shutterSound) { sound.soundOn = vm.shutterSound }
 
     var camera by remember { mutableStateOf<Camera?>(null) }
     var torchOn by remember { mutableStateOf(false) }
@@ -164,7 +168,7 @@ private fun CameraContent(vm: MainViewModel, onOpenReview: () -> Unit) {
         if (alive.get() && !busy) {
             busy = true
             flash = true
-            sound.play(MediaActionSound.SHUTTER_CLICK)
+            sound.play()
             imageCapture.takePicture(captureExecutor, object : ImageCapture.OnImageCapturedCallback() {
                 override fun onCaptureSuccess(image: ImageProxy) {
                     try {
@@ -356,6 +360,12 @@ private fun CameraContent(vm: MainViewModel, onOpenReview: () -> Unit) {
                 OptionChip("한 쪽", vm.layout == Layout.SINGLE) { vm.layout = Layout.SINGLE }
                 OptionChip("양면", vm.layout == Layout.DOUBLE) { vm.layout = Layout.DOUBLE }
                 Spacer(Modifier.weight(1f))
+                IconButton(onClick = { vm.setShutterSoundOn(!vm.shutterSound) }) {
+                    Icon(
+                        if (vm.shutterSound) Icons.AutoMirrored.Filled.VolumeUp else Icons.AutoMirrored.Filled.VolumeOff,
+                        if (vm.shutterSound) "촬영음 끄기" else "촬영음 켜기", tint = Color.White,
+                    )
+                }
                 IconButton(onClick = { torchOn = !torchOn }) {
                     Icon(if (torchOn) Icons.Filled.FlashOn else Icons.Filled.FlashOff, "조명", tint = Color.White)
                 }
