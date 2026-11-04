@@ -89,6 +89,9 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
             try {
                 val eng = engine.await()
                 val newPages = withContext(engineThread) {
+                    // 엔진에 넣는 사진을 그대로 보관 (결과가 이상할 때 원본을 공유해서 확인할 수 있게)
+                    val rawFile = File(sessionDir, "${nextId}_raw.jpg")
+                    runCatching { ImageIO.saveBitmapJpeg(photo, rawFile, 95) }
                     val rgb = ImageIO.bitmapToRgb(photo)
                     photo.recycle()
                     val dewarped = eng.dewarpPages(rgb, lay)
@@ -102,7 +105,7 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
                         val resultFile = File(sessionDir, "${id}_v0.jpg")
                         ImageIO.saveMatJpeg(result, resultFile, 92)
                         result.release()
-                        ScanPage(id, flatFile, resultFile, dp.skipSide, mode, fingers)
+                        ScanPage(id, flatFile, resultFile, dp.skipSide, mode, fingers, rawFile = rawFile.takeIf { it.exists() })
                     }
                 }
                 pages.addAll(newPages)

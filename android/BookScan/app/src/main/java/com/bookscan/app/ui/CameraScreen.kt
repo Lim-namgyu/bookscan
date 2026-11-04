@@ -129,7 +129,9 @@ private fun CameraContent(vm: MainViewModel, onOpenReview: () -> Unit) {
     val previewView = remember { PreviewView(ctx).apply { scaleType = PreviewView.ScaleType.FIT_CENTER } }
     val imageCapture = remember {
         ImageCapture.Builder()
-            .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+            // 화질 우선: 기기의 다중 프레임 합성·잡음 제거를 쓴다(기본 카메라 앱 사진에 가깝게). 촬영이 조금 느려짐
+            .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+            .setJpegQuality(100)
             .setResolutionSelector(
                 ResolutionSelector.Builder()
                     .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)

@@ -1,5 +1,6 @@
 package com.bookscan.app.ui
 
+import android.content.Intent
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectDragGestures
@@ -17,11 +18,13 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.automirrored.filled.Undo
 import androidx.compose.material.icons.filled.AutoFixHigh
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.core.content.FileProvider
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
@@ -45,6 +48,7 @@ import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
@@ -60,6 +64,7 @@ import kotlin.math.min
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun PageScreen(vm: MainViewModel, page: ScanPage, onBack: () -> Unit) {
+    val ctx = LocalContext.current
     val index = vm.pages.indexOfFirst { it.id == page.id }
     var eraser by remember { mutableStateOf(false) }
     val strokes = remember { mutableStateListOf<List<Offset>>() }
@@ -76,6 +81,21 @@ fun PageScreen(vm: MainViewModel, page: ScanPage, onBack: () -> Unit) {
                 title = { Text("${index + 1} / ${vm.pages.size}") },
                 navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "목록") } },
                 actions = {
+                    val raw = page.rawFile
+                    if (raw != null) {
+                        IconButton(onClick = {
+                            // 엔진에 넣은 원본 사진 공유 (결과가 이상할 때 사진째 보내 확인)
+                            runCatching {
+                                val uri = FileProvider.getUriForFile(ctx, ctx.packageName + ".fileprovider", raw)
+                                val send = Intent(Intent.ACTION_SEND).apply {
+                                    type = "image/jpeg"
+                                    putExtra(Intent.EXTRA_STREAM, uri)
+                                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                }
+                                ctx.startActivity(Intent.createChooser(send, "원본 사진 공유"))
+                            }.onFailure { vm.message = "원본 사진 공유 실패: ${it.message}" }
+                        }) { Icon(Icons.Filled.PhotoCamera, "원본 사진 공유") }
+                    }
                     IconButton(onClick = { vm.delete(page); onBack() }) { Icon(Icons.Filled.Delete, "이 페이지 삭제") }
                 },
             )
