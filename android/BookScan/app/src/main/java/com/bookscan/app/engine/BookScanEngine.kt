@@ -130,10 +130,10 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         val mask = if (removeFingers) fingerMask(flat, skipSide) else null
         val hasMask = mask != null && Core.countNonZero(mask) > 0
         val filled = if (hasMask) fillPaper(flat, mask!!) else flat
-        val norm = flattenIllumination(filled)
+        val (norm, bgSmall) = flattenIllumination(filled)
         if (filled !== flat) filled.release()
-        val out = finish(norm, mode)
-        norm.release()
+        val out = finish(norm, mode, bgSmall)
+        norm.release(); bgSmall.release()
         if (hasMask) erase(out, mask!!)
         mask?.release()
         cleanEdges(out, skipSide) // 손가락 검사에서 뺀 쪽 = 접힌 선 쪽
@@ -844,7 +844,8 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
     // ================================================================= 4. 화질 보정
 
     /** 종이 배경(조명·그림자)을 추정해 나눠서 배경을 균일한 흰색으로 */
-    private fun flattenIllumination(img: Mat): Mat {
+    /** 반환: (평탄화한 이미지, 추정한 종이 밝기 지도 — 긴 변 1000px, 회색 CV_32F). 밝기 지도는 반사로 밝은 곳 판단에 쓴다 */
+    private fun flattenIllumination(img: Mat): Pair<Mat, Mat> {
         val h = img.rows()
         val w = img.cols()
         val s = 1000.0 / max(h, w)
@@ -870,9 +871,10 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         val bgGray = Mat()
         Imgproc.cvtColor(bg, bgGray, Imgproc.COLOR_RGB2GRAY)
         bg.release()
-        val wnS = Mat()
-        bgGray.convertTo(wnS, CvType.CV_32F)
+        val bgSmall = Mat()
+        bgGray.convertTo(bgSmall, CvType.CV_32F)
         bgGray.release()
+        val wnS = bgSmall.clone()
         Core.max(wnS, Scalar(1.0), wnS)
         Core.divide(255.0, wnS, wnS)
         wnS.convertTo(wnS, CvType.CV_32F, 1.0 / DENOISE_GAIN_SPAN, -DENOISE_GAIN0 / DENOISE_GAIN_SPAN)
@@ -901,7 +903,123 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
             listOf(wn, blur, o, b, c8).forEach { it.release() }
         }
         wnS.release()
-        return out
+        return Pair(out, bgSmall)
+    }
+
+    // ================================================================= 글자 진하기 자리마다 맞춤
+
+    private class LocalInk(val lv: FloatArray, val ref: Double, val smax: FloatArray)
+
+    /**
+     * 글자 진하기 지도(gs 크기). 초점이 안 맞거나 빛이 비쳐 글자가 옅게 찍힌 곳은 값이 높다.
+     * 글자 크기 덩어리(그림·괘선·망점 제외, 색 글자 제외)의 픽셀만 모아 칸마다 하위 백분위 밝기를 재고 매끈하게 잇는다.
+     * glare: 반사 정도(0~1, gs 크기) — 반사가 있는 칸은 더 옅은 글자도 글자로 보고 더 크게 키운다.
+     * (engine/bookscan.py local_ink_level 와 같음)
+     */
+    private fun localInkLevel(gsM: Mat, gs: ByteArray, paper: Double, chromaS: FloatArray?, glare: FloatArray?): LocalInk? {
+        val h = gsM.rows()
+        val w = gsM.cols()
+        val block = max(15, (min(h, w) * 0.03).toInt()) or 1
+        val m = Mat()
+        Imgproc.adaptiveThreshold(gsM, m, 255.0, Imgproc.ADAPTIVE_THRESH_MEAN_C, Imgproc.THRESH_BINARY_INV, block, 10.0)
+        val lbl = Mat()
+        val st = Mat()
+        val cen = Mat()
+        val n = Imgproc.connectedComponentsWithStats(m, lbl, st, cen, 8, CvType.CV_32S)
+        m.release(); cen.release()
+        if (n < 2) {
+            lbl.release(); st.release(); return null
+        }
+        val stats = IntArray(n * 5).also { st.get(0, 0, it) }
+        st.release()
+        val labels = IntArray(h * w).also { lbl.get(0, 0, it) }
+        lbl.release()
+        val hsOk = ArrayList<Float>()
+        for (i in 1 until n) {
+            val hh = stats[i * 5 + 3]
+            val ww = stats[i * 5 + 2]
+            if (hh >= 4 && hh < h * 0.05 && ww < w * 0.1) hsOk.add(hh.toFloat())
+        }
+        if (hsOk.size < 30) return null
+        val ch = percentile(hsOk.toFloatArray(), 50.0).toDouble()
+        // 글자(흐려서 글자끼리 붙은 덩어리 포함): 높이는 글자 크기, 폭은 글자 몇 개까지. 괘선·상자·그림·망점은 제외
+        val keep = BooleanArray(n) { i ->
+            if (i == 0) false else {
+                val hh = stats[i * 5 + 3]; val ww = stats[i * 5 + 2]; val ar = stats[i * 5 + 4]
+                hh >= 0.5 * ch && hh <= 2.5 * ch && ww >= 0.2 * ch && ww <= 8 * ch && ar >= 0.1 * ch * ch
+            }
+        }
+        val gm = BooleanArray(h * w) { keep[labels[it]] && (chromaS == null || chromaS[it] <= CHROMA_KEEP) }
+        var cntAll = 0
+        for (v in gm) if (v) cntAll++
+        if (cntAll < LOCAL_MIN_PIX * 4) return null
+        val allPix = FloatArray(cntAll)
+        var q = 0
+        for (i in gm.indices) if (gm[i]) allPix[q++] = (gs[i].toInt() and 0xFF).toFloat()
+        val ref = percentile(allPix, LOCAL_PCT).toDouble()
+        val cell = max(8, (w * LOCAL_CELL).roundToInt())
+        val gh = (h + cell - 1) / cell
+        val gw = (w + cell - 1) / cell
+        val valA = FloatArray(gh * gw)
+        val okA = FloatArray(gh * gw)
+        val glA = FloatArray(gh * gw)
+        val buf = FloatArray(cell * cell)
+        for (r in 0 until gh) for (c in 0 until gw) {
+            val y0 = r * cell; val y1 = min(h, y0 + cell); val x0 = c * cell; val x1 = min(w, x0 + cell)
+            var cnt = 0
+            var gsum = 0.0
+            var area = 0
+            for (y in y0 until y1) for (x in x0 until x1) {
+                val i = y * w + x
+                area++
+                if (glare != null) gsum += glare[i]
+                if (gm[i]) buf[cnt++] = (gs[i].toInt() and 0xFF).toFloat()
+            }
+            val gl = if (glare != null && area > 0) (gsum / area).toFloat() else 0f
+            glA[r * gw + c] = gl
+            if (cnt >= LOCAL_MIN_PIX) {
+                val v = percentile(buf.copyOf(cnt), LOCAL_PCT).toDouble()
+                if (v <= paper * (LOCAL_CORE_MAX + (LOCAL_CORE_MAX_GLARE - LOCAL_CORE_MAX) * gl)) {
+                    valA[r * gw + c] = v.toFloat(); okA[r * gw + c] = 1f
+                }
+            }
+        }
+        var okSum = 0f
+        for (v in okA) okSum += v
+        if (okSum < 1f) return null
+        // 빈 칸은 이웃에서 메우며 매끈하게 (정규화 컨볼루션), 멀리 떨어진 빈 칸은 전체 기준값
+        val num = Mat(gh, gw, CvType.CV_32F).also { it.put(0, 0, FloatArray(gh * gw) { valA[it] * okA[it] }) }
+        val den = Mat(gh, gw, CvType.CV_32F).also { it.put(0, 0, okA) }
+        val glM = Mat(gh, gw, CvType.CV_32F).also { it.put(0, 0, glA) }
+        Imgproc.GaussianBlur(num, num, Size(0.0, 0.0), LOCAL_SIGMA, LOCAL_SIGMA, Core.BORDER_REPLICATE)
+        Imgproc.GaussianBlur(den, den, Size(0.0, 0.0), LOCAL_SIGMA, LOCAL_SIGMA, Core.BORDER_REPLICATE)
+        Imgproc.GaussianBlur(glM, glM, Size(0.0, 0.0), LOCAL_SIGMA, LOCAL_SIGMA, Core.BORDER_REPLICATE)
+        val nA = FloatArray(gh * gw).also { num.get(0, 0, it) }
+        val dA = FloatArray(gh * gw).also { den.get(0, 0, it) }
+        val gbA = FloatArray(gh * gw).also { glM.get(0, 0, it) }
+        val lvA = FloatArray(gh * gw) { i ->
+            val d = dA[i]
+            val v = if (d > 0.05f) nA[i] / max(d, 1e-6f) else ref.toFloat()
+            val wgt = min(d / 0.3f, 1f)
+            v * wgt + ref.toFloat() * (1f - wgt)
+        }
+        val smA = FloatArray(gh * gw) { (LOCAL_MAX_STRETCH + (LOCAL_MAX_STRETCH_GLARE - LOCAL_MAX_STRETCH) * gbA[it]).toFloat() }
+        num.put(0, 0, lvA); den.put(0, 0, smA)
+        val lvUp = Mat()
+        val smUp = Mat()
+        Imgproc.resize(num, lvUp, Size((gw * cell).toDouble(), (gh * cell).toDouble()), 0.0, 0.0, Imgproc.INTER_LINEAR)
+        Imgproc.resize(den, smUp, Size((gw * cell).toDouble(), (gh * cell).toDouble()), 0.0, 0.0, Imgproc.INTER_LINEAR)
+        listOf(num, den, glM).forEach { it.release() }
+        val lv = FloatArray(h * w)
+        val sm = FloatArray(h * w)
+        val rowL = FloatArray(gw * cell)
+        val rowS = FloatArray(gw * cell)
+        for (y in 0 until h) {
+            lvUp.get(y, 0, rowL); smUp.get(y, 0, rowS)
+            System.arraycopy(rowL, 0, lv, y * w, w); System.arraycopy(rowS, 0, sm, y * w, w)
+        }
+        lvUp.release(); smUp.release()
+        return LocalInk(lv, ref, sm)
     }
 
     /**
@@ -912,23 +1030,105 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
      *  - 밝기만 바꾸고 색은 같은 비율로 유지(색 상자·그림 보존)
      * 입력이 RGB 면 RGB, 1채널이면 1채널(8비트)을 돌려준다. 메모리를 아끼려 큰 계산은 1채널로.
      */
-    private fun toneMap(norm: Mat): Mat {
+    private fun toneMap(norm: Mat, bgSmall: Mat? = null): Mat {
         val color = norm.channels() == 3
         val h = norm.rows()
         val w = norm.cols()
-        val g8 = Mat()
+        var g8 = Mat()
         if (color) Imgproc.cvtColor(norm, g8, Imgproc.COLOR_RGB2GRAY) else norm.copyTo(g8)
         // 종이 밝기·검정 기준 (긴 변 1000px)
         val s = min(1.0, 1000.0 / max(h, w))
         val gsM = Mat()
         if (s < 1.0) Imgproc.resize(g8, gsM, Size(0.0, 0.0), s, s, Imgproc.INTER_AREA) else g8.copyTo(gsM)
         val gs = ByteArray((gsM.total()).toInt()).also { gsM.get(0, 0, it) }
-        gsM.release()
+        val gsH = gsM.rows()
+        val gsW = gsM.cols()
         val paper = percentileByHistogram(gs, PAPER_PCT)
         val coreThr = paper * INK_DARK
         val core = gs.filter { (it.toInt() and 0xFF) < coreThr }.toByteArray()
         var black = if (core.size > 100) percentileByHistogram(core, BLACK_INK_PCT) else percentileByHistogram(gs, 1.0)
         black = min(black, paper * WHITE_BG - 40.0)
+
+        // 색: 종이 색(누런 기) 기준값 a_p, b_p (글자 진하기 지도에서 색 글자를 빼는 데도 씀)
+        var lab: Mat? = null
+        var aP = 128.0
+        var bP = 128.0
+        var chromaS: FloatArray? = null
+        if (color) {
+            val lb = Mat()
+            Imgproc.cvtColor(norm, lb, Imgproc.COLOR_RGB2Lab)
+            lab = lb
+            val labS = Mat()
+            if (s < 1.0) Imgproc.resize(lb, labS, Size(0.0, 0.0), s, s, Imgproc.INTER_AREA) else lb.copyTo(labS)
+            val lsb = ByteArray((labS.total() * 3).toInt()).also { labS.get(0, 0, it) }
+            labS.release()
+            val ppThr = paper * 0.97
+            val av = ArrayList<Byte>()
+            val bv = ArrayList<Byte>()
+            for (i in gs.indices) if ((gs[i].toInt() and 0xFF) >= ppThr) {
+                av.add(lsb[i * 3 + 1]); bv.add(lsb[i * 3 + 2])
+            }
+            if (av.isNotEmpty()) {
+                aP = percentileByHistogram(av.toByteArray(), 50.0)
+                bP = percentileByHistogram(bv.toByteArray(), 50.0)
+            }
+            chromaS = FloatArray(gs.size) { i ->
+                val da = (lsb[i * 3 + 1].toInt() and 0xFF) - aP
+                val db = (lsb[i * 3 + 2].toInt() and 0xFF) - bP
+                sqrt(da * da + db * db).toFloat()
+            }
+        }
+        // ---- 글자 진하기 자리마다 맞춤: 옅게 찍힌 곳(초점 흐림·반사)의 글자 검정을 전체 글자 검정 자리로 끌어내림
+        var glare: FloatArray? = null
+        if (bgSmall != null) {
+            val bgs = Mat()
+            Imgproc.resize(bgSmall, bgs, gsM.size(), 0.0, 0.0, Imgproc.INTER_LINEAR)
+            val ba = FloatArray((bgs.total()).toInt()).also { bgs.get(0, 0, it) }
+            bgs.release()
+            val med = max(percentile(ba, 50.0).toDouble(), 1.0)
+            glare = FloatArray(ba.size) { ((ba[it] / med - 1.0 - GLARE_START) / (GLARE_FULL - GLARE_START)).coerceIn(0.0, 1.0).toFloat() }
+        }
+        val loc = localInkLevel(gsM, gs, paper, chromaS, glare)
+        gsM.release()
+        val gF0 = Mat()
+        g8.convertTo(gF0, CvType.CV_32F)
+        var gN = gF0
+        if (loc != null) {
+            // 종이에서 떨어진 거리를 k 배: 그 칸의 글자 검정(lv)이 전체 글자 검정(ref) 자리로 온다. 옅은 곳만(k ≥ 1)
+            val kA = FloatArray(loc.lv.size) { ((paper - loc.ref) / max(paper - loc.lv[it], 1.0)).coerceIn(1.0, loc.smax[it].toDouble()).toFloat() }
+            var kMax = 1f
+            for (v in kA) kMax = max(kMax, v)
+            if (kMax > 1.02f) {
+                val kS = Mat(gsH, gsW, CvType.CV_32F).also { it.put(0, 0, kA) }
+                val kFull = Mat()
+                Imgproc.resize(kS, kFull, Size(w.toDouble(), h.toDouble()), 0.0, 0.0, Imgproc.INTER_LINEAR)
+                kS.release()
+                gN = gF0.clone()
+                // 많이 키우는 곳은 대개 초점이 흐린 곳: 획이 서로 붙지 않게 살짝 선명하게 한 뒤 키운다
+                //   amt = clip((k-1)/2, 0, 1) * LOCAL_SHARPEN ;  g += (g - blur(g)) * amt
+                val amt = Mat()
+                kFull.convertTo(amt, CvType.CV_32F, 0.5, -0.5)
+                Core.max(amt, Scalar(0.0), amt)
+                Core.min(amt, Scalar(1.0), amt)
+                Core.multiply(amt, Scalar(LOCAL_SHARPEN), amt)
+                val bl = Mat()
+                Imgproc.GaussianBlur(gN, bl, Size(0.0, 0.0), LOCAL_SHARPEN_SIGMA)
+                Core.subtract(gN, bl, bl)
+                Core.multiply(bl, amt, bl)
+                Core.add(gN, bl, gN)
+                bl.release(); amt.release()
+                // g = paper - (paper - g) * k
+                gN.convertTo(gN, CvType.CV_32F, -1.0, paper)
+                Core.multiply(gN, kFull, gN)
+                gN.convertTo(gN, CvType.CV_32F, -1.0, paper)
+                Core.max(gN, Scalar(0.0), gN)
+                Core.min(gN, Scalar(255.0), gN)
+                kFull.release()
+                g8.release()
+                g8 = Mat()
+                gN.convertTo(g8, CvType.CV_8U)
+            }
+        }
 
         // 글자 근처 지도: 진한 글자 심 주변 + 긴 선(상자 테두리·밑줄) + 색 있는 곳
         val ink = Mat()
@@ -974,28 +1174,9 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         Imgproc.dilate(lines, tmp8, ellipse(5))
         Core.bitwise_or(keep, tmp8, keep)
         // 색: 종이 색(누런 기)을 뺀 채도. 색 상자·그림·색 글씨 근처는 지우지 않는다
-        var lab: Mat? = null
         var chroma: Mat? = null
-        var aP = 128.0
-        var bP = 128.0
         if (color) {
-            val lb = Mat()
-            Imgproc.cvtColor(norm, lb, Imgproc.COLOR_RGB2Lab)
-            lab = lb
-            val labS = Mat()
-            if (s < 1.0) Imgproc.resize(lb, labS, Size(0.0, 0.0), s, s, Imgproc.INTER_AREA) else lb.copyTo(labS)
-            val lsb = ByteArray((labS.total() * 3).toInt()).also { labS.get(0, 0, it) }
-            labS.release()
-            val ppThr = paper * 0.97
-            val av = ArrayList<Byte>()
-            val bv = ArrayList<Byte>()
-            for (i in gs.indices) if ((gs[i].toInt() and 0xFF) >= ppThr) {
-                av.add(lsb[i * 3 + 1]); bv.add(lsb[i * 3 + 2])
-            }
-            if (av.isNotEmpty()) {
-                aP = percentileByHistogram(av.toByteArray(), 50.0)
-                bP = percentileByHistogram(bv.toByteArray(), 50.0)
-            }
+            val lb = lab!!
             val ch = ArrayList<Mat>()
             Core.split(lb, ch)
             val aF = Mat()
@@ -1020,14 +1201,14 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         Imgproc.GaussianBlur(wv, wv, Size(0.0, 0.0), max(1.0, r / 2.0))
         wv.convertTo(wv, CvType.CV_32F, paper * (WHITE_TEXT - WHITE_BG), paper * WHITE_BG - black)
         Core.max(wv, Scalar(1.0), wv)
-        // t = clip((g - black) / (white - black), 0, 1)
-        val gF = Mat()
-        g8.convertTo(gF, CvType.CV_32F)
+        // t = clip((g - black) / (white - black), 0, 1)   (g 는 글자 진하기를 맞춘 것)
         g8.release()
         val t = Mat()
-        Core.subtract(gF, Scalar(black), t)
+        Core.subtract(gN, Scalar(black), t)
         Core.divide(t, wv, t)
         wv.release()
+        if (gN !== gF0) gN.release()
+        val gF = gF0 // 원래 밝기 (색 처리에서 L + (y - g) 의 g)
         Core.max(t, Scalar(0.0), t)
         Core.min(t, Scalar(1.0), t)
         val white = Mat()
@@ -1114,11 +1295,11 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         return out
     }
 
-    private fun finish(norm: Mat, mode: ColorMode): Mat {
-        if (mode == ColorMode.COLOR) return toneMap(norm)
+    private fun finish(norm: Mat, mode: ColorMode, bgSmall: Mat? = null): Mat {
+        if (mode == ColorMode.COLOR) return toneMap(norm, bgSmall)
         val g = Mat()
         Imgproc.cvtColor(norm, g, Imgproc.COLOR_RGB2GRAY)
-        val y = toneMap(g)
+        val y = toneMap(g, bgSmall)
         g.release()
         if (mode == ColorMode.GRAY) return y
         // 흑백: 조명이 이미 고르게 펴졌으므로 한 기준으로 자른다(적응형 이진화는 흐린 획을 끊어 먹음).
@@ -1493,6 +1674,19 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         const val LINE_DARK_FRAC = 0.25 // 이만큼은 있어야 인쇄된 선(접힌 자국·그림자 경계는 더 옅고 고름)
         const val INK_NEAR = 0.006      // 글자 근처로 보는 거리(페이지 폭 비율)
         const val CHROMA_KEEP = 8.0     // 종이 색을 뺀 채도가 이보다 진하면(색 상자·그림·색 글씨) 살림
+        // 글자 진하기 자리마다 맞춤 (engine/bookscan.py LOCAL_* / GLARE_* 와 같은 값)
+        const val LOCAL_CELL = 1.0 / 12
+        const val LOCAL_PCT = 5.0
+        const val LOCAL_MIN_PIX = 60
+        const val LOCAL_CORE_MAX = 0.72
+        const val LOCAL_MAX_STRETCH = 3.0
+        const val LOCAL_SIGMA = 1.0
+        const val GLARE_START = 0.06
+        const val GLARE_FULL = 0.18
+        const val LOCAL_CORE_MAX_GLARE = 0.95
+        const val LOCAL_MAX_STRETCH_GLARE = 8.0
+        const val LOCAL_SHARPEN = 1.0
+        const val LOCAL_SHARPEN_SIGMA = 2.0
         const val COLOR_SAT = 1.3       // 색을 이만큼 진하게(1 = 그대로)
         const val BLACK_INK_PCT = 50.0  // 글자 픽셀 밝기의 이 백분위를 완전한 검정으로
         const val BLACK_OUT = 12.0      // 검정이 놓일 값 (0으로 몰면 글자 가장자리가 뭉개짐)

@@ -677,6 +677,11 @@ FLAT_PREBLUR = 1.5  # 배경 추정 전 흐림(긴 변 1000px 기준)
 
 def flatten_illumination(img):
     """종이 배경(조명·그림자)을 추정해 나눠서 배경을 균일한 흰색으로 만든다."""
+    return flatten_illumination_bg(img)[0]
+
+
+def flatten_illumination_bg(img):
+    """flatten_illumination + 추정한 종이 밝기 지도(긴 변 1000px, 회색). 밝기 지도는 반사로 밝은 곳 판단에 쓴다"""
     h, w = img.shape[:2]
     s = 1000.0 / max(h, w)
     small = cv2.resize(img, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
@@ -696,7 +701,8 @@ def flatten_illumination(img):
     if wn.max() > 0:
         bl = cv2.GaussianBlur(out, (0, 0), DENOISE_SIGMA)
         out = out + (bl - out) * wn[..., None]
-    return np.clip(out, 0, 255)
+    bg_small = cv2.cvtColor(bg, cv2.COLOR_BGR2GRAY).astype(np.float32)  # small 과 같은 크기
+    return np.clip(out, 0, 255), bg_small
 
 
 DENOISE_GAIN0 = 1.5      # 배율이 이보다 크면 흐리기 시작
@@ -724,10 +730,87 @@ BW_T = 140            # 흑백 모드: 톤 보정 후 이보다 어두우면 검
 BW_UPSCALE_BELOW = 1600  # 흑백 모드: 페이지 폭이 이보다 작으면 2배로 키워서 자름
 
 
-def tone_map(norm):
+LOCAL_CELL = 1.0 / 12     # 글자 진하기 지도의 칸 크기(페이지 폭 비율)
+LOCAL_PCT = 5             # 칸 안 글자 픽셀 밝기의 이 백분위 = 그 칸의 '글자 검정'(획 한가운데)
+LOCAL_MIN_PIX = 60        # 칸에 글자 픽셀이 이보다 적으면 비움(이웃에서 보간)
+LOCAL_CORE_MAX = 0.72     # 글자 검정이 종이의 이 비율보다 밝은 칸은 글자가 아니라 비침·얼룩으로 보고 비움
+LOCAL_MAX_STRETCH = 3.0   # 옅은 곳의 대비를 키우는 최대 배율(잡음·뒷면 비침도 같이 커지므로 한계)
+LOCAL_SIGMA = 1.0         # 지도 매끈하게(칸 단위)
+# 빛이 비쳐(반사) 종이가 다른 곳보다 밝은 곳은 글자가 훨씬 옅게 찍힌다. 그런 곳은 뒷면 비침과 헷갈릴 일이 적으므로
+# 더 옅은 글자까지 글자로 보고 더 크게 키운다
+GLARE_START = 0.06        # 종이 밝기가 페이지 중앙값보다 이 비율 이상 밝으면 반사로 보기 시작
+GLARE_FULL = 0.18         # 이 비율이면 완전한 반사
+LOCAL_CORE_MAX_GLARE = 0.95
+LOCAL_MAX_STRETCH_GLARE = 8.0
+LOCAL_SHARPEN = 1.0       # 대비를 많이 키우는 곳(배율 3 이상)에 더하는 선명도(언샤프 마스크 세기)
+LOCAL_SHARPEN_SIGMA = 2.0
+
+
+def local_ink_level(gs, paper, chroma_s=None, glare=None):
+    """
+    글자 진하기 지도(gs 크기). 초점이 안 맞거나 빛이 비쳐 글자가 옅게 찍힌 곳은 값이 높다.
+    글자 크기 덩어리(그림·괘선·망점 제외, 색 글자 제외)의 픽셀만 모아 칸마다 하위 백분위 밝기를 재고
+    매끈하게 잇는다. glare: 반사 정도 지도(gs 크기, 0~1) — 반사가 있는 칸은 더 옅은 글자도 글자로 본다.
+    반환: (지도, 전체 기준값, 칸별 최대 배율 지도) 또는 None(글자가 적음).
+    """
+    h, w = gs.shape
+    g8 = np.clip(gs, 0, 255).astype(np.uint8)
+    block = max(15, int(min(h, w) * 0.03)) | 1
+    m = cv2.adaptiveThreshold(g8, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, block, 10)
+    n, lbl, st, _ = cv2.connectedComponentsWithStats(m, 8)
+    if n < 2:
+        return None
+    hs = st[1:, cv2.CC_STAT_HEIGHT].astype(np.float32)
+    ws = st[1:, cv2.CC_STAT_WIDTH].astype(np.float32)
+    ar = st[1:, cv2.CC_STAT_AREA].astype(np.float32)
+    okc = (hs >= 4) & (hs < h * 0.05) & (ws < w * 0.1)
+    if okc.sum() < 30:
+        return None
+    ch = float(np.median(hs[okc]))
+    # 글자(흐려서 글자끼리 붙은 덩어리 포함): 높이는 글자 크기, 폭은 글자 몇 개까지. 괘선·상자·그림·망점은 제외
+    keep = np.zeros(n, bool)
+    keep[1:] = (hs >= 0.5 * ch) & (hs <= 2.5 * ch) & (ws >= 0.2 * ch) & (ws <= 8 * ch) & (ar >= 0.1 * ch * ch)
+    gm = keep[lbl]
+    if chroma_s is not None:
+        gm &= chroma_s <= CHROMA_KEEP  # 색 글자는 원래 회색으로 찍히므로 제외
+    if gm.sum() < LOCAL_MIN_PIX * 4:
+        return None
+    ref = float(np.percentile(gs[gm], LOCAL_PCT))
+    cell = max(8, int(round(w * LOCAL_CELL)))
+    gh, gw = (h + cell - 1) // cell, (w + cell - 1) // cell
+    val = np.zeros((gh, gw), np.float32)
+    ok = np.zeros((gh, gw), np.float32)
+    gl = np.zeros((gh, gw), np.float32)
+    for r in range(gh):
+        for c in range(gw):
+            sl = (slice(r * cell, min(h, (r + 1) * cell)), slice(c * cell, min(w, (c + 1) * cell)))
+            if glare is not None:
+                gl[r, c] = float(glare[sl].mean())
+            pix = gs[sl][gm[sl]]
+            if pix.size >= LOCAL_MIN_PIX:
+                v = float(np.percentile(pix, LOCAL_PCT))
+                if v <= paper * (LOCAL_CORE_MAX + (LOCAL_CORE_MAX_GLARE - LOCAL_CORE_MAX) * gl[r, c]):
+                    val[r, c] = v
+                    ok[r, c] = 1.0
+    if ok.sum() < 1:
+        return None
+    # 빈 칸은 이웃에서 메우며 매끈하게 (정규화 컨볼루션), 멀리 떨어진 빈 칸은 전체 기준값
+    num = cv2.GaussianBlur(val * ok, (0, 0), LOCAL_SIGMA, borderType=cv2.BORDER_REPLICATE)
+    den = cv2.GaussianBlur(ok, (0, 0), LOCAL_SIGMA, borderType=cv2.BORDER_REPLICATE)
+    lv = np.where(den > 0.05, num / np.maximum(den, 1e-6), ref).astype(np.float32)
+    lv = lv * np.minimum(den / 0.3, 1.0) + ref * (1.0 - np.minimum(den / 0.3, 1.0))
+    lv = cv2.resize(lv, (gw * cell, gh * cell), interpolation=cv2.INTER_LINEAR)[:h, :w]
+    smax = LOCAL_MAX_STRETCH + (LOCAL_MAX_STRETCH_GLARE - LOCAL_MAX_STRETCH) * cv2.GaussianBlur(gl, (0, 0), LOCAL_SIGMA, borderType=cv2.BORDER_REPLICATE)
+    smax = cv2.resize(smax.astype(np.float32), (gw * cell, gh * cell), interpolation=cv2.INTER_LINEAR)[:h, :w]
+    return lv, ref, smax
+
+
+def tone_map(norm, bg=None):
     """
     조명 평탄화된 float 이미지 → 종이는 흰색, 글자는 원래 모양(가장자리의 부드러운 회색 포함) 그대로 진하게.
+    bg: 조명 평탄화 때 추정한 종이 밝기 지도(있으면 반사로 밝은 곳에서 더 옅은 글자까지 살림)
     글자를 이진화하듯 깎지 않는다(획이 끊기거나 얇아지거나 얼룩덜룩해지지 않게).
+      - 글자 진하기를 자리마다 맞춤: 초점이 안 맞거나 빛이 비쳐 글자가 옅게 찍힌 곳은 대비를 키워 살림
       - 흰색 기준을 자리마다 다르게: 진한 글자·긴 선·색 있는 곳 근처는 높게(가장자리 보존),
         그 밖은 낮게(뒷면에서 비치는 글씨와 종이 얼룩은 흰색으로)
       - 밝기만 바꾸고 색은 같은 비율로 유지(색 상자·그림 보존)
@@ -735,6 +818,7 @@ def tone_map(norm):
     color = norm.ndim == 3
     n8 = np.clip(norm, 0, 255).astype(np.uint8)
     g = cv2.cvtColor(n8, cv2.COLOR_BGR2GRAY).astype(np.float32) if color else n8.astype(np.float32)
+    g0 = g
     h, w = g.shape
     s = min(1.0, 1000.0 / max(h, w))
     gs = cv2.resize(g, None, fx=s, fy=s, interpolation=cv2.INTER_AREA) if s < 1 else g
@@ -742,6 +826,30 @@ def tone_map(norm):
     core = gs[gs < paper * INK_DARK]
     black = float(np.percentile(core, BLACK_INK_PCT)) if core.size > 100 else float(np.percentile(gs, 1.0))
     black = min(black, paper * WHITE_BG - 40.0)
+    # ---- 글자 진하기 자리마다 맞춤: 옅게 찍힌 곳(초점 흐림·반사)의 글자 검정을 전체 검정 기준으로 끌어내림
+    chroma_s = None
+    if color:
+        labs0 = cv2.cvtColor(cv2.resize(n8, (gs.shape[1], gs.shape[0]), interpolation=cv2.INTER_AREA) if s < 1 else n8,
+                             cv2.COLOR_BGR2LAB).astype(np.float32)
+        pp0 = gs >= paper * 0.97
+        chroma_s = np.hypot(labs0[..., 1] - (np.median(labs0[..., 1][pp0]) if pp0.any() else 128.0),
+                            labs0[..., 2] - (np.median(labs0[..., 2][pp0]) if pp0.any() else 128.0))
+    glare = None
+    if bg is not None:
+        bgs = cv2.resize(bg, (gs.shape[1], gs.shape[0]), interpolation=cv2.INTER_LINEAR)
+        glare = np.clip((bgs / max(float(np.median(bgs)), 1.0) - 1.0 - GLARE_START) / (GLARE_FULL - GLARE_START), 0, 1).astype(np.float32)
+    loc = local_ink_level(gs, paper, chroma_s, glare)
+    if loc is not None:
+        lv, ref, smax = loc
+        # 종이에서 떨어진 거리를 k 배: 그 칸의 글자 검정(lv)이 전체 글자 검정(ref) 자리로 온다. 옅은 곳만(k ≥ 1)
+        k = np.clip((paper - ref) / np.maximum(paper - lv, 1.0), 1.0, smax).astype(np.float32)
+        if float(k.max()) > 1.02:
+            k_full = cv2.resize(k, (w, h), interpolation=cv2.INTER_LINEAR) if s < 1 else k
+            # 많이 키우는 곳은 대개 초점이 흐린 곳: 획이 서로 붙지 않게 살짝 선명하게 한 뒤 키운다
+            amt = np.clip((k_full - 1.0) / 2.0, 0, 1) * LOCAL_SHARPEN
+            if float(amt.max()) > 0.01:
+                g = g + (g - cv2.GaussianBlur(g, (0, 0), LOCAL_SHARPEN_SIGMA)) * amt
+            g = np.clip(paper - (paper - g) * k_full, 0, 255)
     # 글자 근처 지도
     ink = (g < paper * INK_DARK).astype(np.uint8)
     faint = (g < paper * LINE_FAINT).astype(np.uint8)
@@ -783,7 +891,7 @@ def tone_map(norm):
         # (RGB 에 같은 비율을 곱하면 밝은 색이 255 에서 잘려 색이 바래므로 Lab 에서 처리)
         # 색이 있는 곳만 색을 남긴다. 검은 글자의 가장자리 색 번짐(카메라 색수차)은 무채색으로
         colored = np.clip((chroma - CHROMA_KEEP * 0.5) / CHROMA_KEEP, 0, 1)
-        Lp = lab[..., 0] + (y - g)
+        Lp = lab[..., 0] + (y - g0)
         ap = 128.0 + (lab[..., 1] - a_p) * (COLOR_SAT * colored)
         bp = 128.0 + (lab[..., 2] - b_p) * (COLOR_SAT * colored)
         out = cv2.cvtColor(np.clip(np.dstack([Lp, ap, bp]), 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR).astype(np.float32)
@@ -796,12 +904,12 @@ def tone_map(norm):
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
-def finish(norm, mode="color"):
-    """norm: 조명 평탄화된 float 이미지. mode: color / gray / bw"""
+def finish(norm, mode="color", bg=None):
+    """norm: 조명 평탄화된 float 이미지. mode: color / gray / bw. bg: 종이 밝기 지도(flatten_illumination_bg)"""
     if mode == "color":
-        return tone_map(norm)
+        return tone_map(norm, bg)
     g = cv2.cvtColor(np.clip(norm, 0, 255).astype(np.uint8), cv2.COLOR_BGR2GRAY).astype(np.float32)
-    y = tone_map(g)
+    y = tone_map(g, bg)
     if mode == "gray":
         return y
     # 흑백: 조명이 이미 고르게 펴졌으므로 한 기준으로 자른다(적응형 이진화는 흐린 획을 끊어 먹음).
@@ -984,7 +1092,8 @@ class BookScanner:
             # 양면이면 왼쪽 페이지의 오른쪽, 오른쪽 페이지의 왼쪽이 접힌 선
             skip = None if len(parts) == 1 else ("right" if idx == 0 else "left")
             m = finger_mask(flat, skip)
-            out = finish(flatten_illumination(fill_paper(flat, m)), mode)
+            norm, bg = flatten_illumination_bg(fill_paper(flat, m))
+            out = finish(norm, mode, bg)
             gside = None if len(parts) == 1 else ("right" if idx == 0 else "left")
             pages.append(Page(clean_edges(erase(out, m), gside), flat, m))
         return pages
