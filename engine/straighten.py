@@ -238,8 +238,19 @@ SCALE_CLAMP = (0.85, 1.18)
 SCALE_INLIER_FRAC = 0.5  # 글줄의 이 비율 이상이 추세에 맞아야 (제목·재료 목록 같은 다른 크기 줄은 빠짐)
 SCALE_RESID_MAX = 0.03   # 추세를 뺀 글자 높이 흩어짐(log) 최대
 SCALE_SPREAD_MIN = 0.5   # 추세에 맞는 줄들이 페이지 높이의 이 비율 이상에 걸쳐 있어야
+SCALE_RHO_MIN = 0.5      # 모든 글줄(추세에 안 맞는 줄 포함)에서 세로 위치와 글자 높이의 순위 상관이 이 이상이어야
 SCALE_QUART_MIN = 2      # 그 범위를 넷으로 나눴을 때 칸마다 최소 줄 수
 DEBUG = None
+
+
+def _spearman(x, y):
+    """순위 상관(스피어만). 값이 같은 경우는 드물어 단순 순위로"""
+    rx = np.argsort(np.argsort(x)).astype(np.float64)
+    ry = np.argsort(np.argsort(y)).astype(np.float64)
+    rx -= rx.mean()
+    ry -= ry.mean()
+    d = np.sqrt((rx * rx).sum() * (ry * ry).sum())
+    return float((rx * ry).sum() / d) if d > 0 else 0.0
 
 
 def _band_height(src, L, ch, offs):
@@ -314,6 +325,19 @@ def _vertical_scale(gray_clean, lines, ch, h):
     T, H = np.array(T), np.array(H)
     y = T / h
     lr = np.log(H / np.median(H))
+    # 말림이면 글자 크기가 섞인 줄(제목·보기)까지 포함해도 높이가 세로 위치를 따라 한쪽으로 변한다(순위 상관).
+    # 크기가 섞인 쪽에서 우연히 일부 줄만 추세를 이루는 경우를 거른다. (위아래가 다 커지는 U자 말림은 반쪽씩)
+    half = y < np.median(y)
+    rhos = [_spearman(y, lr)]
+    if half.sum() >= 6:
+        rhos.append(_spearman(y[half], lr[half]))
+    if (~half).sum() >= 6:
+        rhos.append(_spearman(y[~half], lr[~half]))
+    rho = max(abs(r) for r in rhos)
+    if DEBUG is not None:
+        DEBUG['rho'] = round(rho, 2)
+    if rho < SCALE_RHO_MIN:
+        return None
     deg = 2 if len(T) >= 15 else 1
     keep = np.ones(len(T), bool)
     coef = None

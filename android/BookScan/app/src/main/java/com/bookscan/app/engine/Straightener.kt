@@ -50,6 +50,7 @@ object Straightener {
     private const val SCALE_RESID_MAX = 0.03   // 추세를 뺀 글자 높이 흩어짐(log) 최대
     private const val SCALE_SPREAD_MIN = 0.5   // 추세에 맞는 줄들이 페이지 높이의 이 비율 이상에 걸쳐야
     private const val SCALE_QUART_MIN = 2      // 그 범위를 넷으로 나눴을 때 칸마다 최소 줄 수
+    private const val SCALE_RHO_MIN = 0.5      // 모든 글줄에서 세로 위치와 글자 높이의 순위 상관이 이 이상이어야
 
     /** 입력: RGB(8UC3) 또는 GRAY(8UC1). 글자가 너무 적으면 null */
     fun maps(img: Mat): Maps? {
@@ -671,6 +672,15 @@ object Straightener {
         val y = DoubleArray(n) { T[it] / h }
         val medH = median(H.toDoubleArray())
         val lr = DoubleArray(n) { ln(H[it] / medH) }
+        // 말림이면 글자 크기가 섞인 줄까지 포함해도 높이가 세로 위치를 따라 한쪽으로 변한다(순위 상관).
+        // 크기가 섞인 쪽에서 우연히 일부 줄만 추세를 이루는 경우를 거른다. (위아래가 다 커지는 U자 말림은 반쪽씩)
+        val medY = median(y)
+        val top = (0 until n).filter { y[it] < medY }
+        val bot = (0 until n).filter { y[it] >= medY }
+        var rho = abs(spearman(y, lr))
+        if (top.size >= 6) rho = max(rho, abs(spearman(DoubleArray(top.size) { y[top[it]] }, DoubleArray(top.size) { lr[top[it]] })))
+        if (bot.size >= 6) rho = max(rho, abs(spearman(DoubleArray(bot.size) { y[bot[it]] }, DoubleArray(bot.size) { lr[bot[it]] })))
+        if (rho < SCALE_RHO_MIN) return null
         val deg = if (n >= 15) 2 else 1
         var keep = BooleanArray(n) { true }
         var poly: Poly? = null
@@ -1052,6 +1062,27 @@ object Straightener {
         }
         val dx = xs[hi] - xs[lo]
         return if (dx == 0.0) ys[hi] else ys[lo] + (ys[hi] - ys[lo]) * (x - xs[lo]) / dx
+    }
+
+    /** 순위 상관(스피어만). 값이 같은 경우는 드물어 단순 순위로 */
+    private fun spearman(x: DoubleArray, y: DoubleArray): Double {
+        val n = x.size
+        val rx = DoubleArray(n)
+        val ry = DoubleArray(n)
+        x.indices.sortedBy { x[it] }.forEachIndexed { rank, i -> rx[i] = rank.toDouble() }
+        y.indices.sortedBy { y[it] }.forEachIndexed { rank, i -> ry[i] = rank.toDouble() }
+        val mx = rx.average()
+        val my = ry.average()
+        var sxy = 0.0
+        var sxx = 0.0
+        var syy = 0.0
+        for (i in 0 until n) {
+            val a = rx[i] - mx
+            val b = ry[i] - my
+            sxy += a * b; sxx += a * a; syy += b * b
+        }
+        val d = sqrt(sxx * syy)
+        return if (d > 0) sxy / d else 0.0
     }
 
     private fun median(v: DoubleArray): Double = BookScanEngine.median(v)
