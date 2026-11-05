@@ -433,7 +433,7 @@ private fun CameraContent(vm: MainViewModel, onOpenReview: () -> Unit) {
                         if (vm.shutterSound) "촬영음 끄기" else "촬영음 켜기", tint = Color.White,
                     )
                 }
-                IconButton(onClick = { vm.setHdrCapture(!vm.hdrCapture) }) {
+                IconButton(onClick = { vm.setHdrCaptureOn(!vm.hdrCapture) }) {
                     Icon(
                         if (vm.hdrCapture) Icons.Filled.HdrOn else Icons.Filled.HdrOff,
                         if (vm.hdrCapture) "HDR 촬영 끄기" else "HDR 촬영 켜기",

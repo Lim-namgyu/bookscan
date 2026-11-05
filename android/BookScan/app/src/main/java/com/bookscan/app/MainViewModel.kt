@@ -76,7 +76,7 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
     /** 실제로 HDR 이 적용되어 카메라가 열렸는지 (화면 표시용) */
     var hdrActive by mutableStateOf(false)
 
-    fun setHdrCapture(on: Boolean) {
+    fun setHdrCaptureOn(on: Boolean) {
         hdrCapture = on
         prefs.edit().putBoolean("hdrCapture", on).apply()
     }
