@@ -75,6 +75,7 @@ dependencies {
     implementation("androidx.camera:camera-camera2:$camerax")
     implementation("androidx.camera:camera-lifecycle:$camerax")
     implementation("androidx.camera:camera-view:$camerax")
+    implementation("androidx.camera:camera-extensions:$camerax") // 기기 카메라의 HDR(다중 프레임 합성) 촬영
 
     // 글자 읽기(OCR, 온디바이스 한국어·영어): 검색 가능한 PDF 의 글자층
     implementation("com.google.mlkit:text-recognition-korean:16.0.1")

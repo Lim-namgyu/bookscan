@@ -48,6 +48,10 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.VolumeOff
+import androidx.compose.material.icons.filled.HdrOn
+import androidx.compose.material.icons.filled.HdrOff
+import androidx.camera.extensions.ExtensionMode
+import androidx.camera.extensions.ExtensionsManager
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.Autorenew
 import androidx.compose.material.icons.filled.FlashOff
@@ -285,6 +289,9 @@ private fun CameraContent(vm: MainViewModel, onOpenReview: () -> Unit) {
         }
     }
 
+    // HDR 켜기/끄기를 바꾸면 카메라만 다시 연다(아래 DisposableEffect 가 채워 줌)
+    val rebind = remember { mutableStateOf<((Boolean) -> Unit)?>(null) }
+    LaunchedEffect(vm.hdrCapture) { rebind.value?.invoke(vm.hdrCapture) }
     DisposableEffect(Unit) {
         val future = ProcessCameraProvider.getInstance(ctx)
         val analysisExecutor = Executors.newSingleThreadExecutor()
@@ -303,17 +310,60 @@ private fun CameraContent(vm: MainViewModel, onOpenReview: () -> Unit) {
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                 .build()
             analysis.setAnalyzer(analysisExecutor, readiness)
-            try {
-                provider.unbindAll()
-                camera = provider.bindToLifecycle(
-                    lifecycleOwner, CameraSelector.DEFAULT_BACK_CAMERA, preview, imageCapture, analysis
-                )
-            } catch (e: Exception) {
-                vm.message = "카메라를 시작하지 못했어요: ${e.message}"
+            val bind: (CameraSelector, Boolean) -> Unit = { selector, hdr ->
+                if (!disposed) {
+                    try {
+                        provider.unbindAll()
+                        camera = provider.bindToLifecycle(lifecycleOwner, selector, preview, imageCapture, analysis)
+                        vm.hdrActive = hdr
+                    } catch (e: Exception) {
+                        if (hdr) {
+                            // HDR 조합을 기기가 거부하면 보통 카메라로
+                            runCatching {
+                                provider.unbindAll()
+                                camera = provider.bindToLifecycle(
+                                    lifecycleOwner, CameraSelector.DEFAULT_BACK_CAMERA, preview, imageCapture, analysis
+                                )
+                                vm.hdrActive = false
+                            }.onFailure { vm.message = "카메라를 시작하지 못했어요: ${it.message}" }
+                        } else {
+                            vm.message = "카메라를 시작하지 못했어요: ${e.message}"
+                        }
+                    }
+                }
             }
+            val open: (Boolean) -> Unit = { wantHdr ->
+                if (wantHdr) {
+                    // 기기 카메라의 HDR 확장(여러 장을 합성해 잡음을 줄이고 그림자·반사 부분을 살림)이 있으면 그걸로 연다.
+                    // 촬영 안내용 영상 분석(ImageAnalysis)도 같이 돌아가는 조합만 쓴다
+                    val extFuture = ExtensionsManager.getInstanceAsync(ctx, provider)
+                    extFuture.addListener({
+                        var selector = CameraSelector.DEFAULT_BACK_CAMERA
+                        var hdr = false
+                        runCatching {
+                            val ext = extFuture.get()
+                            for (mode in listOf(ExtensionMode.HDR, ExtensionMode.AUTO)) {
+                                if (ext.isExtensionAvailable(CameraSelector.DEFAULT_BACK_CAMERA, mode) &&
+                                    ext.isImageAnalysisSupported(CameraSelector.DEFAULT_BACK_CAMERA, mode)
+                                ) {
+                                    selector = ext.getExtensionEnabledCameraSelector(CameraSelector.DEFAULT_BACK_CAMERA, mode)
+                                    hdr = true
+                                    break
+                                }
+                            }
+                        }
+                        bind(selector, hdr)
+                    }, mainExecutor)
+                } else {
+                    bind(CameraSelector.DEFAULT_BACK_CAMERA, false)
+                }
+            }
+            rebind.value = open
+            open(vm.hdrCapture)
         }, mainExecutor)
         onDispose {
             disposed = true
+            rebind.value = null
             alive.set(false)
             readiness.onTrigger = null
             readiness.onStatus = null
@@ -381,6 +431,13 @@ private fun CameraContent(vm: MainViewModel, onOpenReview: () -> Unit) {
                     Icon(
                         if (vm.shutterSound) Icons.AutoMirrored.Filled.VolumeUp else Icons.AutoMirrored.Filled.VolumeOff,
                         if (vm.shutterSound) "촬영음 끄기" else "촬영음 켜기", tint = Color.White,
+                    )
+                }
+                IconButton(onClick = { vm.setHdrCapture(!vm.hdrCapture) }) {
+                    Icon(
+                        if (vm.hdrCapture) Icons.Filled.HdrOn else Icons.Filled.HdrOff,
+                        if (vm.hdrCapture) "HDR 촬영 끄기" else "HDR 촬영 켜기",
+                        tint = if (vm.hdrCapture && !vm.hdrActive) Color.Gray else Color.White, // 회색: 켰지만 기기가 지원 안 함
                     )
                 }
                 IconButton(onClick = { torchOn = !torchOn }) {

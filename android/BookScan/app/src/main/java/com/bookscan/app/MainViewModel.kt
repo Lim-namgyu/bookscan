@@ -69,6 +69,17 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
         shutterSound = on
         prefs.edit().putBoolean("shutterSound", on).apply()
     }
+
+    // HDR 촬영(기기 카메라의 다중 프레임 합성: 잡음 적고 그림자·반사 부분도 살아남) — 기기가 지원할 때만 적용
+    var hdrCapture by mutableStateOf(prefs.getBoolean("hdrCapture", true))
+        private set
+    /** 실제로 HDR 이 적용되어 카메라가 열렸는지 (화면 표시용) */
+    var hdrActive by mutableStateOf(false)
+
+    fun setHdrCapture(on: Boolean) {
+        hdrCapture = on
+        prefs.edit().putBoolean("hdrCapture", on).apply()
+    }
     var processing by mutableIntStateOf(0)
         private set
     var message by mutableStateOf<String?>(null)
