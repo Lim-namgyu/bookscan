@@ -1984,6 +1984,36 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
                 mb[k] = 255.toByte(); any = true
             }
         }
+        // 접힌 선 쪽 변에 붙은 찌꺼기(옆 페이지 글자의 시작이 접힌 곳에서 가로로 늘어난 얼룩 등): 변에 닿은 어두운 것이
+        // 띠 안에서 깨끗한 흰 틈(폭 1% 이상)으로 본문과 떨어져 있으면 그 틈까지 통째로 지운다. 안쪽 여백은 늘 있으므로 안전
+        if (gutterSide == Side.LEFT || gutterSide == Side.RIGHT) {
+            val db = ByteArray(sh * sw).also { dark.get(0, 0, it) }
+            val inkc = FloatArray(sw)
+            for (y in 0 until sh) for (x in 0 until sw) if (db[y * sw + x].toInt() != 0) inkc[x] += 1f
+            for (x in 0 until sw) inkc[x] /= sh.toFloat()
+            val right = gutterSide == Side.RIGHT
+            fun col(i: Int): Float = if (right) inkc[sw - 1 - i] else inkc[i]
+            val gap = max(3, (sw * EDGE_REM_GAP).toInt())
+            val bandw = if (right) br else bl
+            var content = false
+            for (i in 0 until gap) if (col(i) > EDGE_REM_INK) content = true
+            if (content) {
+                var run = 0
+                var cut = -1
+                for (i in 0 until min(sw, bandw + gap)) {
+                    run = if (col(i) <= EDGE_REM_INK) run + 1 else 0
+                    if (run >= gap) {
+                        cut = i - gap + 1; break
+                    }
+                }
+                if (cut in 1..bandw) {
+                    for (y in 0 until sh) for (i in 0 until cut) {
+                        mb[y * sw + (if (right) sw - 1 - i else i)] = 255.toByte()
+                    }
+                    any = true
+                }
+            }
+        }
         dark.release()
         if (!any) return
         val m = Mat(sh, sw, CvType.CV_8UC1).also { it.put(0, 0, mb) }
@@ -2237,6 +2267,8 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         const val EDGE_BAND = 0.04
         const val EDGE_GUTTER = 0.06
         const val EDGE_TEXTURE = 0.08
+        const val EDGE_REM_GAP = 0.01   // 접힌 선 쪽 변의 찌꺼기와 본문 사이 흰 틈의 최소 폭(페이지 폭 비율)
+        const val EDGE_REM_INK = 0.002  // 열에 어두운 픽셀이 이 비율 이하면 '깨끗한' 열
         const val EDGE_FOLD_LEN = 0.5      // 접힌 선 쪽 띠에서 이 비율(페이지 높이) 넘게 이어진 세로선은 상자 테두리로 보지 않음
         const val EDGE_STROKE_THIN = 0.006 // 변에 닿은 획을 지울 최대 굵기(페이지 폭 비율)
         const val EDGE_STROKE_MAX = 0.10   // 변에 닿은 획을 지울 최대 길이(페이지 높이 비율)

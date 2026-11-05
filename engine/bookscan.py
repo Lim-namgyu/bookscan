@@ -1275,6 +1275,28 @@ def clean_edges(out, gutter_side=None):
         hit = ((x <= tx and x + bw <= dx) or (x + bw >= sw - tx and x >= sw - dx)) and bh >= 3 * bw
         if hit:
             m[y:y + bh, x:x + bw][lbl[y:y + bh, x:x + bw] == i] = 255
+    # 접힌 선 쪽 변에 붙은 찌꺼기(옆 페이지 글자의 시작이 접힌 곳에서 가로로 늘어난 얼룩 등): 변에 닿은 어두운 것이
+    # 띠 안에서 깨끗한 흰 틈(폭 1% 이상)으로 본문과 떨어져 있으면 그 틈까지 통째로 지운다. 안쪽 여백은 늘 있으므로 안전
+    if gutter_side in ("left", "right"):
+        inkc = (dark > 0).mean(axis=0)
+        cols = inkc[::-1] if gutter_side == "right" else inkc
+        gap = max(3, int(sw * EDGE_REM_GAP))
+        bandw = br if gutter_side == "right" else bl
+        content = cols[:gap].max() > EDGE_REM_INK  # 변에 닿은 내용이 있을 때만
+        if content:
+            clean = cols <= EDGE_REM_INK
+            run = 0
+            cut = -1
+            for i in range(bandw + gap):
+                run = run + 1 if clean[i] else 0
+                if run >= gap:
+                    cut = i - gap + 1
+                    break
+            if 0 < cut <= bandw:
+                if gutter_side == "right":
+                    m[:, sw - cut:] = 255
+                else:
+                    m[:, :cut] = 255
     if not m.any():
         return out
     m = cv2.dilate(m, np.ones((5, 5), np.uint8))
@@ -1293,6 +1315,8 @@ EDGE_BOX = 0.03       # 가장자리 선이 이보다 넓게(세로선) / 높게
 EDGE_BAND = 0.04
 EDGE_GUTTER = 0.06
 EDGE_FOLD_LEN = 0.5   # 접힌 선 쪽 띠에서 이 비율(페이지 높이) 넘게 이어진 세로선은 상자 테두리로 보지 않음
+EDGE_REM_GAP = 0.01   # 접힌 선 쪽 변의 찌꺼기와 본문 사이 흰 틈의 최소 폭(페이지 폭 비율)
+EDGE_REM_INK = 0.002  # 열에 어두운 픽셀이 이 비율 이하면 '깨끗한' 열
 
 
 ERASE_LIGHT = 200  # 손가락 주변 띠에서 이보다 밝은 것(남은 옅은 그림자)만 흰색으로. 글자 가장자리 회색은 보존
