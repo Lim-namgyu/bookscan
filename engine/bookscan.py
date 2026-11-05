@@ -870,7 +870,7 @@ BLACK_INK_PCT = 50.0  # 글자 픽셀 밝기의 이 백분위를 완전한 검�
 BLACK_OUT = 12.0      # 검정이 놓일 값 (0으로 몰면 글자 가장자리가 뭉개짐)
 TONE_GAMMA = 1.5      # 1보다 크면 글자가 더 진하고 굵게
 S_MIX = 0.6           # S자 곡선 섞는 비율(0~1): 클수록 글자 둘레 얼룩이 깨끗해지지만 옅은 인쇄도 옅어짐
-SHARPEN = 0.3         # 언샤프 마스크 세기 (너무 세면 글자가 얼룩덜룩해짐)
+SHARPEN = 0.0         # 마지막 언샤프 마스크 세기. 획 되살리기(restore_strokes)가 가장자리를 세우므로 끔(켜면 가장자리가 울퉁불퉁해짐)
 SHARPEN_SIGMA = 1.0
 BW_T = 140            # 흑백 모드: 톤 보정 후 이보다 어두우면 검정
 BW_UPSCALE_BELOW = 1600  # 흑백 모드: 페이지 폭이 이보다 작으면 2배로 키워서 자름
@@ -960,8 +960,9 @@ SHARP_MIN_EDGE = 300      # 칸에 글자 가장자리 픽셀이 이보다 적�
 # 획 모양 되살리기: 흐려져 넓고 옅어진 획을 원래 폭의 또렷한 획으로(글자 덩어리 근처에서만)
 STROKE_SLOPE = 3.0        # (글자 검정~종이) 사이 중간값을 중심으로 한 S-곡선의 중간 기울기 (1 = 그대로)
 STROKE_MID = 0.5          # 곡선 중심 (0.5 = 종이와 글자 검정의 한가운데: 흐려진 대칭 가장자리의 원래 자리)
-STROKE_SMOOTH_CH = 0.09   # 곡선 전에 잡음을 누르는 양방향 필터의 공간 σ = 글자 높이 × 이 값 (0.6~2px)
-STROKE_SMOOTH_COLOR = 20.0  # 양방향 필터의 밝기 σ (이보다 밝기 차가 큰 가장자리는 뭉개지 않음)
+STROKE_SMOOTH_CH = 0.04   # 곡선 전에 잡음을 누르는 가우시안 σ = 글자 높이 × 이 값 (0.4~0.9px, 원본 축척)
+STROKE_SS = 2             # 곡선은 이 배율로 키운 상태에서 먹이고 다시 줄인다(수퍼샘플링: 가장자리가 계단지지 않고 매끈하게)
+STROKE_TILE = 256         # 수퍼샘플링 메모리를 줄이기 위한 가로 띠 높이(원본 행)
 
 
 def local_sharpness(g):
@@ -1050,15 +1051,26 @@ def restore_strokes(g, paper, black, loc, k, s, ink, ch_px, lw, colored, r):
         lv_full = cv2.resize(lv_s, (w, h), interpolation=cv2.INTER_LINEAR) if s < 1 else lv_s
     else:
         lv_full = np.full_like(g, min(black, paper - 30.0))
-    sd = float(np.clip(STROKE_SMOOTH_CH * ch_px, 0.6, 2.0))
-    gd = cv2.bilateralFilter(g, 0, STROKE_SMOOTH_COLOR, sd)
-    t = np.clip((gd - lv_full) / np.maximum(paper - lv_full, 1.0), 0, 1)
+    # 곡선은 STROKE_SS 배로 키운 상태에서(가장자리 위치가 픽셀 사이에 놓이게) 먹이고 면적 평균으로 줄인다 → 매끈한 가장자리.
+    # 메모리를 아끼려고 가로 띠로 나눠 처리(띠 경계는 여유를 두고 겹침)
+    ss = STROKE_SS
+    sg = float(np.clip(STROKE_SMOOTH_CH * ch_px, 0.4, 0.9)) * ss
     a = STROKE_SLOPE * 4.0
-    z = 1.0 / (1.0 + np.exp(-(t - STROKE_MID) * a))
     z0 = 1.0 / (1.0 + np.exp(STROKE_MID * a))
     z1 = 1.0 / (1.0 + np.exp(-(1.0 - STROKE_MID) * a))
-    z = np.clip((z - z0) / (z1 - z0), 0, 1)
-    gr = lv_full + (paper - lv_full) * z
+    pad = 8
+    gr = np.empty_like(g)
+    for y0 in range(0, h, STROKE_TILE):
+        y1 = min(h, y0 + STROKE_TILE)
+        ya, yb = max(0, y0 - pad), min(h, y1 + pad)
+        gw = cv2.resize(g[ya:yb], (w * ss, (yb - ya) * ss), interpolation=cv2.INTER_CUBIC)
+        lvw = cv2.resize(lv_full[ya:yb], (w * ss, (yb - ya) * ss), interpolation=cv2.INTER_LINEAR)
+        gw = cv2.GaussianBlur(gw, (0, 0), sg)
+        t = np.clip((gw - lvw) / np.maximum(paper - lvw, 1.0), 0, 1)
+        z = 1.0 / (1.0 + np.exp(-(t - STROKE_MID) * a))
+        z = np.clip((z - z0) / (z1 - z0), 0, 1)
+        band = cv2.resize(lvw + (paper - lvw) * z, (w, yb - ya), interpolation=cv2.INTER_AREA)
+        gr[y0:y1] = band[y0 - ya:y1 - ya]
     return g * (1.0 - txw) + gr * txw
 
 

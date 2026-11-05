@@ -96,6 +96,13 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
                     photo.recycle()
                     val dewarped = eng.dewarpPages(rgb, lay)
                     rgb.release()
+                    // 흐리게 찍혔으면 알림 (보정은 그대로 하되 다시 찍기를 권함)
+                    val sharp = dewarped.minOfOrNull { dp -> eng.sharpness(dp.flat).let { if (it < 0) Double.MAX_VALUE else it } }
+                    if (sharp != null && sharp < BookScanEngine.BLUR_WARN) {
+                        withContext(Dispatchers.Main) {
+                            message = "흐리게 찍혔어요. 폰을 고정하고 책에 조금 더 가까이 대서 다시 찍어 주세요 (초점이 맞으면 초록 테두리)"
+                        }
+                    }
                     dewarped.map { dp ->
                         val id = nextId++
                         val flatFile = File(sessionDir, "${id}_flat.jpg")

@@ -171,41 +171,56 @@ private fun CameraContent(vm: MainViewModel, onOpenReview: () -> Unit) {
             busy = true
             flash = true
             sound.play()
-            imageCapture.takePicture(captureExecutor, object : ImageCapture.OnImageCapturedCallback() {
-                override fun onCaptureSuccess(image: ImageProxy) {
-                    try {
-                        val rot = image.imageInfo.rotationDegrees
-                        val raw = image.toBitmap()
-                        image.close()
-                        // 똑바로 세우면서 처리 해상도(긴 변 3000px)로 줄이기
-                        val sc = MainViewModel.targetScale(raw.width, raw.height)
-                        val m = Matrix().apply {
-                            postScale(sc, sc)
-                            postRotate(rot.toFloat())
-                        }
-                        val upright = Bitmap.createBitmap(raw, 0, 0, raw.width, raw.height, m, true)
-                        if (upright !== raw) raw.recycle()
-                        readiness.markCaptured()
-                        mainExecutor.execute {
-                            busy = false
-                            vm.onPhoto(upright)
-                        }
-                    } catch (t: Throwable) {
-                        runCatching { image.close() }
-                        mainExecutor.execute {
-                            busy = false
-                            vm.message = "사진 처리 실패: ${t.message}"
+            val takePicture = {
+                imageCapture.takePicture(captureExecutor, object : ImageCapture.OnImageCapturedCallback() {
+                    override fun onCaptureSuccess(image: ImageProxy) {
+                        try {
+                            val rot = image.imageInfo.rotationDegrees
+                            val raw = image.toBitmap()
+                            image.close()
+                            // 똑바로 세우면서 처리 해상도(긴 변 3000px)로 줄이기
+                            val sc = MainViewModel.targetScale(raw.width, raw.height)
+                            val m = Matrix().apply {
+                                postScale(sc, sc)
+                                postRotate(rot.toFloat())
+                            }
+                            val upright = Bitmap.createBitmap(raw, 0, 0, raw.width, raw.height, m, true)
+                            if (upright !== raw) raw.recycle()
+                            readiness.markCaptured()
+                            mainExecutor.execute {
+                                busy = false
+                                vm.onPhoto(upright)
+                            }
+                        } catch (t: Throwable) {
+                            runCatching { image.close() }
+                            mainExecutor.execute {
+                                busy = false
+                                vm.message = "사진 처리 실패: ${t.message}"
+                            }
                         }
                     }
-                }
 
-                override fun onError(exception: ImageCaptureException) {
-                    mainExecutor.execute {
-                        busy = false
-                        vm.message = "촬영 실패: ${exception.message}"
+                    override fun onError(exception: ImageCaptureException) {
+                        mainExecutor.execute {
+                            busy = false
+                            vm.message = "촬영 실패: ${exception.message}"
+                        }
                     }
-                }
-            })
+                })
+            }
+            // 찍기 직전에 화면 가운데(책)에 초점을 한 번 더 맞춘다(기본 카메라 앱의 반셔터와 같음).
+            // 연속 초점이 책이 아닌 곳에 가 있거나 아직 안 맞은 채 찍혀 글자가 흐려지는 것을 막는다. 실패·시간 초과여도 찍는다
+            val cam = camera
+            if (cam != null && previewView.width > 0 && previewView.height > 0) {
+                val point = previewView.meteringPointFactory.createPoint(previewView.width / 2f, previewView.height / 2f)
+                val action = FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF)
+                    .setAutoCancelDuration(3, java.util.concurrent.TimeUnit.SECONDS)
+                    .build()
+                val fut = runCatching { cam.cameraControl.startFocusAndMetering(action) }.getOrNull()
+                if (fut != null) fut.addListener({ takePicture() }, mainExecutor) else takePicture()
+            } else {
+                takePicture()
+            }
         }
     }
 

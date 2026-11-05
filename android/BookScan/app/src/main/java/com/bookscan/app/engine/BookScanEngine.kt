@@ -127,6 +127,23 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
     }
 
     /** 2단계: 손가락 제거 + 화질 보정. 결과는 RGB 8UC3(컬러) 또는 8UC1(회색·흑백) */
+    /**
+     * 펴진 페이지의 글자 선명도(중앙값). 선명한 사진 0.40 안팎, 흐린 사진 0.30 아래. 글자를 못 찾으면 -1.
+     * 찍은 직후 흐린 사진을 알려 다시 찍게 하는 데 쓴다 (프리뷰로는 작은 흐림을 못 잡음).
+     */
+    fun sharpness(flat: Mat): Double {
+        val g8 = Mat()
+        if (flat.channels() == 3) Imgproc.cvtColor(flat, g8, Imgproc.COLOR_RGB2GRAY) else flat.copyTo(g8)
+        val gF = Mat()
+        g8.convertTo(gF, CvType.CV_32F)
+        val (shM, _) = localSharpness(g8, gF)
+        g8.release(); gF.release()
+        if (shM == null) return -1.0
+        val v = FloatArray((shM.total()).toInt()).also { shM.get(0, 0, it) }
+        shM.release()
+        return percentile(v, 50.0).toDouble()
+    }
+
     fun clean(flat: Mat, mode: ColorMode, removeFingers: Boolean, skipSide: Side?): Mat {
         val mask = if (removeFingers) fingerMask(flat, skipSide) else null
         val hasMask = mask != null && Core.countNonZero(mask) > 0
@@ -1423,43 +1440,62 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         } else {
             lvFull = Mat(h, w, CvType.CV_32F, Scalar(min(black, paper - 30.0)))
         }
-        val sd = (STROKE_SMOOTH_CH * ch).coerceIn(0.6, 2.0)
-        val gd = Mat()
-        Imgproc.bilateralFilter(g, gd, 0, STROKE_SMOOTH_COLOR, sd)
-        // t = clip((gd - lv') / max(paper - lv', 1), 0, 1)
-        val den = Mat()
-        lvFull.convertTo(den, CvType.CV_32F, -1.0, paper)
-        Core.max(den, Scalar(1.0), den)
-        val t = Mat()
-        Core.subtract(gd, lvFull, t)
-        gd.release()
-        Core.divide(t, den, t)
-        Core.max(t, Scalar(0.0), t)
-        Core.min(t, Scalar(1.0), t)
-        // z = (σ((t - mid)·a) - z0) / (z1 - z0),  σ(x) = 1/(1+e^-x)
+        // 곡선은 STROKE_SS 배로 키운 상태에서(가장자리 위치가 픽셀 사이에 놓이게) 먹이고 면적 평균으로 줄인다 → 매끈한 가장자리.
+        // 메모리를 아끼려고 가로 띠로 나눠 처리(띠 경계는 여유를 두고 겹침)
+        val ss = STROKE_SS
+        val sg = (STROKE_SMOOTH_CH * ch).coerceIn(0.4, 0.9) * ss
         val a = STROKE_SLOPE * 4.0
         val z0 = 1.0 / (1.0 + exp(STROKE_MID * a))
         val z1 = 1.0 / (1.0 + exp(-(1.0 - STROKE_MID) * a))
-        val z = Mat()
-        t.convertTo(z, CvType.CV_32F, -a, STROKE_MID * a) // -(t - mid)·a
-        t.release()
-        Core.exp(z, z)
-        Core.add(z, Scalar(1.0), z)
-        Core.divide(1.0, z, z)
-        z.convertTo(z, CvType.CV_32F, 1.0 / (z1 - z0), -z0 / (z1 - z0))
-        Core.max(z, Scalar(0.0), z)
-        Core.min(z, Scalar(1.0), z)
-        // gr = lv' + (paper - lv') * z ;  out = g + (gr - g) * txw
-        Core.multiply(den, z, den)
-        z.release()
-        Core.add(den, lvFull, den)
+        val pad = 8
+        val gr = Mat(h, w, CvType.CV_32F)
+        var y0 = 0
+        while (y0 < h) {
+            val y1 = min(h, y0 + STROKE_TILE)
+            val ya = max(0, y0 - pad)
+            val yb = min(h, y1 + pad)
+            val bigSize = Size((w * ss).toDouble(), ((yb - ya) * ss).toDouble())
+            val gw = Mat()
+            Imgproc.resize(g.submat(ya, yb, 0, w), gw, bigSize, 0.0, 0.0, Imgproc.INTER_CUBIC)
+            val lvw = Mat()
+            Imgproc.resize(lvFull.submat(ya, yb, 0, w), lvw, bigSize, 0.0, 0.0, Imgproc.INTER_LINEAR)
+            Imgproc.GaussianBlur(gw, gw, Size(0.0, 0.0), sg)
+            // t = clip((gw - lv') / max(paper - lv', 1), 0, 1)
+            val den = Mat()
+            lvw.convertTo(den, CvType.CV_32F, -1.0, paper)
+            Core.max(den, Scalar(1.0), den)
+            Core.subtract(gw, lvw, gw)
+            Core.divide(gw, den, gw)
+            Core.max(gw, Scalar(0.0), gw)
+            Core.min(gw, Scalar(1.0), gw)
+            // z = (σ((t - mid)·a) - z0) / (z1 - z0),  σ(x) = 1/(1+e^-x)
+            gw.convertTo(gw, CvType.CV_32F, -a, STROKE_MID * a) // -(t - mid)·a
+            Core.exp(gw, gw)
+            Core.add(gw, Scalar(1.0), gw)
+            Core.divide(1.0, gw, gw)
+            gw.convertTo(gw, CvType.CV_32F, 1.0 / (z1 - z0), -z0 / (z1 - z0))
+            Core.max(gw, Scalar(0.0), gw)
+            Core.min(gw, Scalar(1.0), gw)
+            // gr = lv' + (paper - lv') * z
+            Core.multiply(den, gw, gw)
+            den.release()
+            Core.add(gw, lvw, gw)
+            lvw.release()
+            val band = Mat()
+            Imgproc.resize(gw, band, Size(w.toDouble(), (yb - ya).toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
+            gw.release()
+            band.submat(y0 - ya, y1 - ya, 0, w).copyTo(gr.submat(y0, y1, 0, w))
+            band.release()
+            y0 = y1
+        }
         lvFull.release()
-        Core.subtract(den, g, den)
-        Core.multiply(den, txw, den)
+        // out = g + (gr - g) * txw
+        Core.subtract(gr, g, gr)
+        Core.multiply(gr, txw, gr)
         txw.release()
         val out = Mat()
-        Core.add(g, den, out)
-        den.release()
+        Core.add(g, gr, out)
+        gr.release()
         return out
     }
 
@@ -2189,6 +2225,8 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         const val LINE_DARK_FRAC = 0.25 // 이만큼은 있어야 인쇄된 선(접힌 자국·그림자 경계는 더 옅고 고름)
         const val INK_NEAR = 0.006      // 글자 근처로 보는 거리(페이지 폭 비율)
         const val CHROMA_KEEP = 8.0     // 종이 색을 뺀 채도가 이보다 진하면(색 상자·그림·색 글씨) 살림
+        /** 찍은 사진의 글자 선명도가 이보다 낮으면 '흐리게 찍혔다'고 알림 (sharpness()) */
+        const val BLUR_WARN = 0.30
         // 초점 흐린 곳 선명하게 (engine/bookscan.py SHARP_* / PRE_SHARPEN_* 와 같은 값)
         const val SHARP_REF = 0.37
         const val SHARP_SPAN = 0.13
@@ -2199,8 +2237,9 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         // 획 모양 되살리기 (engine/bookscan.py STROKE_* 와 같은 값)
         const val STROKE_SLOPE = 3.0
         const val STROKE_MID = 0.5
-        const val STROKE_SMOOTH_CH = 0.09
-        const val STROKE_SMOOTH_COLOR = 20.0
+        const val STROKE_SMOOTH_CH = 0.04
+        const val STROKE_SS = 2
+        const val STROKE_TILE = 256
         // 글자 진하기 자리마다 맞춤 (engine/bookscan.py LOCAL_* / GLARE_* 와 같은 값)
         const val LOCAL_CELL = 1.0 / 12
         const val LOCAL_PCT = 5.0
@@ -2223,7 +2262,7 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         const val DENOISE_GAIN0 = 1.5     // 조명 평탄화 배율이 이보다 크면 흐리기 시작
         const val DENOISE_GAIN_SPAN = 2.5 // 배율 4(배경 밝기 64) 에서 완전히 흐림
         const val DENOISE_SIGMA = 1.0
-        const val SHARPEN = 0.3         // 언샤프 마스크 세기 (너무 세면 글자가 얼룩덜룩해짐)
+        const val SHARPEN = 0.0         // 마지막 언샤프 마스크 세기. 획 되살리기가 가장자리를 세우므로 끔(켜면 울퉁불퉁해짐)
         const val SHARPEN_SIGMA = 1.0
         const val BW_T = 140.0          // 흑백 모드: 톤 보정 후 이보다 어두우면 검정
         const val BW_UPSCALE_BELOW = 1600 // 흑백 모드: 페이지 폭이 이보다 작으면 2배로 키워서 자름
