@@ -52,9 +52,9 @@ class BookRegion:
         cnts, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         comp = np.zeros_like(comp)
         cv2.drawContours(comp, cnts, -1, 255, -1)
-        if paper_outside(img, comp) > PAPER_OUTSIDE_MAX:
-            # 책 바깥이어야 할 곳이 대부분 종이(밝고 매끈함) → 페이지가 화면을 꽉 채웠거나 표·그림만 잡은 것.
-            # 이런 마스크로 자르면 페이지 일부가 잘려 나가므로 쓰지 않는다.
+        if paper_outside(img, comp) > PAPER_OUTSIDE_MAX or text_outside(img, comp) > TEXT_OUTSIDE_MAX:
+            # 책 바깥이어야 할 곳이 대부분 종이(밝고 매끈함)거나 글자가 많음 → 페이지가 화면을 꽉 채웠거나
+            # 페이지의 일부(한 단)만 잡은 것. 이런 마스크로 자르면 페이지 일부가 잘려 나가므로 쓰지 않는다.
             return None, None
         m = cv2.resize(comp, (w, h), interpolation=cv2.INTER_LINEAR)
         m = np.where(m > 127, 255, 0).astype(np.uint8)
@@ -83,6 +83,64 @@ def paper_outside(img, comp):
     if n_out == 0:
         return 0.0
     return float(((g >= 0.85 * paper) & smooth & out).sum()) / n_out
+
+
+TEXT_OUTSIDE_MAX = 0.5   # 마스크 바깥의 글줄 글자 수가 안쪽의 이 비율보다 많으면 마스크를 믿지 않음 (바닥 천 무늬는 0.2 이하)
+
+
+def text_outside(img, comp):
+    """마스크 바깥에 있는 글자 크기 덩어리 수 / 안쪽 글자 덩어리 수 (긴 변 1000px 에서). 바깥에 글자가 없으면 0"""
+    h, w = img.shape[:2]
+    s = 1000.0 / max(h, w)
+    sw, sh = max(1, int(round(w * s))), max(1, int(round(h * s)))
+    g = cv2.cvtColor(cv2.resize(img, (sw, sh), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
+    mm = cv2.resize(comp, (sw, sh), interpolation=cv2.INTER_LINEAR) > 127
+    if not mm.any():
+        return 0.0
+    paper = float(np.percentile(g[mm], 75))
+    ink = (g < paper * 0.55).astype(np.uint8)
+    n, lbl, st, cen = cv2.connectedComponentsWithStats(ink, 8)
+    if n < 2:
+        return 0.0
+    hs, ws = st[1:, cv2.CC_STAT_HEIGHT], st[1:, cv2.CC_STAT_WIDTH]
+    glyph = (hs >= 4) & (hs <= sh * 0.03) & (ws <= sw * 0.06) & (ws >= 2)
+    if glyph.sum() < 30:
+        return 0.0
+    cxf, cyf = cen[1:, 0][glyph], cen[1:, 1][glyph]
+    hg = hs[glyph].astype(np.float64)
+    cx = np.clip(cxf.astype(int), 0, sw - 1)
+    cy = np.clip(cyf.astype(int), 0, sh - 1)
+    inside = cv2.dilate(mm.astype(np.uint8), np.ones((15, 15), np.uint8))[cy, cx] > 0
+    # 글자는 줄을 이룬다: 양옆(같은 높이, 글자 높이의 4배 안)에 이웃 덩어리가 있는 것만 글자로 센다
+    # (바닥 천의 무늬·잡티는 흩어져 있어 줄을 이루지 못함)
+    order = np.argsort(cxf)
+    xs_, ys_, hs_ = cxf[order], cyf[order], hg[order]
+    inline = np.zeros(len(order), bool)
+    for i in range(len(order)):
+        tol_y = 0.6 * hs_[i]
+        reach = 4.0 * hs_[i]
+        j = i - 1
+        left = False
+        while j >= 0 and xs_[i] - xs_[j] <= reach:
+            if abs(ys_[j] - ys_[i]) <= tol_y:
+                left = True
+                break
+            j -= 1
+        j = i + 1
+        right = False
+        while j < len(order) and xs_[j] - xs_[i] <= reach:
+            if abs(ys_[j] - ys_[i]) <= tol_y:
+                right = True
+                break
+            j += 1
+        inline[i] = left and right
+    inl = np.zeros(len(order), bool)
+    inl[order] = inline
+    n_in = int((inl & inside).sum())
+    n_out = int((inl & ~inside).sum())
+    if n_out < 30:
+        return 0.0
+    return n_out / max(n_in, 1)
 
 
 def hull_mask(m):

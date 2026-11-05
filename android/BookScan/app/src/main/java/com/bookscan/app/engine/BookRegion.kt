@@ -13,6 +13,7 @@ import org.opencv.core.Scalar
 import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
 import java.nio.FloatBuffer
+import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.max
 import kotlin.math.min
@@ -118,9 +119,9 @@ class BookRegion(modelBytes: ByteArray, threads: Int = 4) : AutoCloseable {
         comp.setTo(Scalar(0.0))
         Imgproc.drawContours(comp, cnts, -1, Scalar(255.0), -1)
         cnts.forEach { it.release() }
-        if (paperOutside(rgb, comp) > PAPER_OUTSIDE_MAX) {
-            // 책 바깥이어야 할 곳이 대부분 종이(밝고 매끈함) → 페이지가 화면을 꽉 채웠거나 표·그림만 잡은 것.
-            // 이런 마스크로 자르면 페이지 일부가 잘려 나가므로 쓰지 않는다.
+        if (paperOutside(rgb, comp) > PAPER_OUTSIDE_MAX || textOutside(rgb, comp) > TEXT_OUTSIDE_MAX) {
+            // 책 바깥이어야 할 곳이 대부분 종이(밝고 매끈함)거나 글자가 많음 → 페이지가 화면을 꽉 채웠거나
+            // 페이지의 일부(한 단)만 잡은 것. 이런 마스크로 자르면 페이지 일부가 잘려 나가므로 쓰지 않는다.
             comp.release()
             lastReason = REASON_FILLS
             return null
@@ -185,6 +186,97 @@ class BookRegion(modelBytes: ByteArray, threads: Int = 4) : AutoCloseable {
         return if (nOut == 0) 0.0 else nPaper.toDouble() / nOut
     }
 
+    /**
+     * region.text_outside: 마스크 바깥에 있는 글줄 글자 수 / 안쪽 글줄 글자 수 (긴 변 1000px). 바깥에 글자가 없으면 0.
+     * 글자는 줄을 이룬다: 양옆(같은 높이, 글자 높이의 4배 안)에 이웃 덩어리가 있는 것만 글자로 센다
+     * (바닥 천의 무늬·잡티는 흩어져 있어 줄을 이루지 못함).
+     */
+    private fun textOutside(rgb: Mat, comp: Mat): Double {
+        val h = rgb.rows()
+        val w = rgb.cols()
+        val s = 1000.0 / max(h, w)
+        val sw = max(1, Math.rint(w * s).toInt())
+        val sh = max(1, Math.rint(h * s).toInt())
+        val small = Mat()
+        Imgproc.resize(rgb, small, Size(sw.toDouble(), sh.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
+        val g8 = Mat()
+        Imgproc.cvtColor(small, g8, Imgproc.COLOR_RGB2GRAY)
+        small.release()
+        val mm = Mat()
+        Imgproc.resize(comp, mm, Size(sw.toDouble(), sh.toDouble()), 0.0, 0.0, Imgproc.INTER_LINEAR)
+        val n = sw * sh
+        val mb = ByteArray(n).also { mm.get(0, 0, it) }
+        val gb = ByteArray(n).also { g8.get(0, 0, it) }
+        val insideVals = ArrayList<Double>()
+        for (i in 0 until n) if ((mb[i].toInt() and 0xFF) > 127) insideVals.add((gb[i].toInt() and 0xFF).toDouble())
+        if (insideVals.isEmpty()) {
+            g8.release(); mm.release(); return 0.0
+        }
+        val paper = BookScanEngine.percentile(insideVals.toDoubleArray(), 75.0)
+        val ink = Mat()
+        Imgproc.threshold(g8, ink, ceil(paper * 0.55) - 1.0, 255.0, Imgproc.THRESH_BINARY_INV) // g < paper*0.55
+        g8.release()
+        val lbl = Mat()
+        val st = Mat()
+        val cen = Mat()
+        val nc = Imgproc.connectedComponentsWithStats(ink, lbl, st, cen, 8, CvType.CV_32S)
+        ink.release(); lbl.release()
+        if (nc < 2) {
+            st.release(); cen.release(); mm.release(); return 0.0
+        }
+        val stats = IntArray(nc * 5).also { st.get(0, 0, it) }
+        val cents = DoubleArray(nc * 2).also { cen.get(0, 0, it) }
+        st.release(); cen.release()
+        val dil = Mat()
+        Imgproc.threshold(mm, dil, 127.0, 255.0, Imgproc.THRESH_BINARY)
+        mm.release()
+        val k15 = Mat.ones(15, 15, CvType.CV_8UC1)
+        Imgproc.dilate(dil, dil, k15)
+        k15.release()
+        val db = ByteArray(n).also { dil.get(0, 0, it) }
+        dil.release()
+        val xs = ArrayList<Double>()
+        val ys = ArrayList<Double>()
+        val hs = ArrayList<Double>()
+        val ins = ArrayList<Boolean>()
+        for (i in 1 until nc) {
+            val hh = stats[i * 5 + Imgproc.CC_STAT_HEIGHT]
+            val ww = stats[i * 5 + Imgproc.CC_STAT_WIDTH]
+            if (hh >= 4 && hh <= sh * 0.03 && ww <= sw * 0.06 && ww >= 2) {
+                val cx = cents[i * 2].toInt().coerceIn(0, sw - 1)
+                val cy = cents[i * 2 + 1].toInt().coerceIn(0, sh - 1)
+                xs.add(cents[i * 2]); ys.add(cents[i * 2 + 1]); hs.add(hh.toDouble())
+                ins.add(db[cy * sw + cx].toInt() != 0)
+            }
+        }
+        if (xs.size < 30) return 0.0
+        val order = xs.indices.sortedBy { xs[it] }
+        var nIn = 0
+        var nOut = 0
+        for (k in order.indices) {
+            val i = order[k]
+            val tolY = 0.6 * hs[i]
+            val reach = 4.0 * hs[i]
+            var left = false
+            var j = k - 1
+            while (j >= 0 && xs[i] - xs[order[j]] <= reach) {
+                if (abs(ys[order[j]] - ys[i]) <= tolY) { left = true; break }
+                j--
+            }
+            var right = false
+            j = k + 1
+            while (j < order.size && xs[order[j]] - xs[i] <= reach) {
+                if (abs(ys[order[j]] - ys[i]) <= tolY) { right = true; break }
+                j++
+            }
+            if (left && right) {
+                if (ins[i]) nIn++ else nOut++
+            }
+        }
+        if (nOut < 30) return 0.0
+        return nOut.toDouble() / max(nIn, 1)
+    }
+
     companion object {
         const val SIZE = 320
 
@@ -195,6 +287,8 @@ class BookRegion(modelBytes: ByteArray, threads: Int = 4) : AutoCloseable {
 
         /** 마스크 바깥 중 종이처럼 보이는 비율이 이보다 크면 마스크를 믿지 않음 */
         const val PAPER_OUTSIDE_MAX = 0.15
+        /** 마스크 바깥의 글줄 글자 수가 안쪽의 이 비율보다 많으면 마스크를 믿지 않음 (바닥 천 무늬는 0.2 이하) */
+        const val TEXT_OUTSIDE_MAX = 0.5
         private val MEAN = floatArrayOf(0.485f, 0.456f, 0.406f)
         private val STD = floatArrayOf(0.229f, 0.224f, 0.225f)
 

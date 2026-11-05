@@ -328,6 +328,9 @@ class Dewarper:
         # 좌우는 연장하지 않는다(책 옆면 띠가 들어오면 그 위의 손가락과 엉겨 손가락 찾기가 어려워짐).
         px, py = extend_grid_v(px, GRID_EXT), extend_grid_v(py, GRID_EXT)
         oh = oh * (GRID_H - 1 + 2 * GRID_EXT) / (GRID_H - 1)
+        # 모델이 잡은 좌우 경계가 글자를 가로지르면(페이지가 사진 밖으로 잘렸거나 경계를 안쪽에 잡음) 그쪽으로 연장
+        px, py, ext_l, ext_r = extend_grid_to_text(px, py, img)
+        ow = ow * (GRID_W - 1 + ext_l + ext_r) / (GRID_W - 1)
         ow, oh = int(round(ow * scale)), int(round(oh * scale))
 
         # 분석용 작은 페이지
@@ -361,9 +364,17 @@ class Dewarper:
         t, bt, l, r = trim_rect(out)
         H_, W_ = out.shape[:2]
         out = out[t:H_ - bt, l:W_ - r]
+        # 사진 밖(격자를 사진 끝 너머로 연장한 곳)은 가장자리 픽셀이 늘어나 줄무늬가 되므로 페이지 밖으로 본다
+        inb = ((FX >= 0) & (FX <= w - 1) & (FY >= 0) & (FY <= h - 1)).astype(np.uint8) * 255
+        inb = cv2.erode(inb, np.ones((5, 5), np.uint8))
+        pm = None
         if mask is not None:
             pm = cv2.remap(mask, FX, FY, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-            out = apply_page_mask(out, pm[t:H_ - bt, l:W_ - r])
+        if (inb == 0).any():
+            pm = inb if pm is None else cv2.min(pm, inb)
+            info["outside_photo"] = float((inb == 0).mean())
+        if pm is not None:
+            out = apply_page_mask(out, pm[t:H_ - bt, l:W_ - r], erode=mask is not None)
         return out, info
 
     def dewarp(self, img):
@@ -371,12 +382,12 @@ class Dewarper:
         return self.rectify(img, straighten=False)[0]
 
 
-def apply_page_mask(flat, pm):
+def apply_page_mask(flat, pm, erode=True):
     """
     곡면 편 페이지에서 책 바깥(바닥·책상 무늬)을 지운다.
       1) 마스크가 절반도 안 덮는 가장자리 행·열은 잘라내고
       2) 남은 부분 중 마스크 바깥은 주변 종이색으로 메운다(손가락 메우기와 같은 방법) → 보정 후 흰색.
-    마스크 경계가 거칠어(320 격자) 조금 안쪽으로 줄여서 쓴다. 페이지 여백은 비어 있어 손실 없음.
+    마스크 경계가 거칠어(320 격자) 조금 안쪽으로 줄여서 쓴다(erode). 페이지 여백은 비어 있어 손실 없음.
     """
     if pm is None:
         return flat
@@ -384,8 +395,9 @@ def apply_page_mask(flat, pm):
     inside = pm > 127
     if inside.mean() < 0.3:  # 마스크가 이상하면 손대지 않음
         return flat
-    e = max(3, int(min(h, w) * PAGE_MASK_ERODE)) | 1
-    inside = cv2.erode(inside.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (e, e))) > 0
+    if erode:
+        e = max(3, int(min(h, w) * PAGE_MASK_ERODE)) | 1
+        inside = cv2.erode(inside.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (e, e))) > 0
     colc, rowc = inside.mean(axis=0), inside.mean(axis=1)
     cols, rows = np.where(colc >= 0.5)[0], np.where(rowc >= 0.5)[0]
     if len(cols) < w * 0.5 or len(rows) < h * 0.5:
@@ -446,6 +458,81 @@ def aspect_ratio_fix(mx, my):
     ratio = ju / np.maximum(jv, 1e-6)
     r = float(np.percentile(ratio, ASPECT_PCT))
     return float(np.clip(r, ASPECT_MIN, ASPECT_MAX))
+
+
+GRID_EXT_H_MAX = 8      # 좌우로 연장할 최대 칸 수
+EXT_STRADDLE_MIN = 6    # 경계선 양쪽에 걸친 글자 덩어리가 이보다 많아야 '글자를 가로지른 것'
+
+
+def _text_mask_for_grid(img):
+    """글자 픽셀(0/1, 원본 크기). 큰 덩어리(그림·상자)는 제외"""
+    return _text_components(img)[0]
+
+
+def _text_components(img):
+    """글자 크기 덩어리: (마스크 0/1 원본 크기, 덩어리 상자 배열 [x, y, w, h] 원본 좌표)"""
+    h, w = img.shape[:2]
+    s = 1000.0 / max(h, w)
+    small = cv2.resize(img, None, fx=s, fy=s, interpolation=cv2.INTER_AREA) if s < 1 else img
+    g = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    block = max(15, int(min(g.shape) * 0.03)) | 1
+    m = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, block, 12)
+    n, lbl, st, _ = cv2.connectedComponentsWithStats(m, 8)
+    hs, ws = st[:, cv2.CC_STAT_HEIGHT], st[:, cv2.CC_STAT_WIDTH]
+    keep = (hs >= 3) & (hs <= g.shape[0] * 0.03) & (ws <= g.shape[1] * 0.06)
+    keep[0] = False
+    tm = keep[lbl].astype(np.uint8)
+    boxes = st[keep][:, :4].astype(np.float64) / s
+    return cv2.resize(tm, (w, h), interpolation=cv2.INTER_NEAREST), boxes
+
+
+def extend_grid_to_text(px, py, img):
+    """
+    격자의 왼쪽/오른쪽 경계선이 글자를 가로지르면(페이지가 사진 밖으로 잘렸거나 모델이 경계를 글 안쪽에 잡음)
+    그쪽으로 격자를 직선 연장해 경계가 사진 끝에 닿게 한다. '가로지른다' = 경계선 양쪽에 걸친 글자 덩어리가
+    여럿(높이 여러 곳에) 있다. 옆 페이지 글이나 책 옆면 무늬는 경계에 걸치지 않는다.
+    반환: (px, py, 왼쪽 연장 칸 수, 오른쪽 연장 칸 수)
+    """
+    h, w = img.shape[:2]
+    boxes = None
+    ext = [0, 0]
+    for side in (0, 1):
+        bx = px[:, 0] if side == 0 else px[:, -1]
+        by = py[:, 0] if side == 0 else py[:, -1]
+        if boxes is None:
+            boxes = _text_components(img)[1]
+            if len(boxes) == 0:
+                break
+        order = np.argsort(by)
+        cy = boxes[:, 1] + boxes[:, 3] / 2.0
+        xb = np.interp(cy, by[order], bx[order])
+        x0, x1 = boxes[:, 0], boxes[:, 0] + boxes[:, 2]
+        straddle = (x0 < xb - 1.0) & (x1 > xb + 1.0) & (boxes[:, 2] >= 3)
+        n_str = int(straddle.sum())
+        if n_str < EXT_STRADDLE_MIN:
+            continue
+        rows = cy[straddle]
+        if (rows.max() - rows.min()) < h * 0.15:  # 한 군데(그림·낙서)가 아니라 여러 글줄에 걸쳐야
+            continue
+        # 경계가 사진 끝에 닿을 때까지 연장. 칸 폭은 경계 두 열의 차이
+        if side == 0:
+            step = np.abs(px[:, 0] - px[:, 1]).mean()
+            need = float(bx.max()) / max(step, 1.0)
+        else:
+            step = np.abs(px[:, -1] - px[:, -2]).mean()
+            need = float(w - 1 - bx.min()) / max(step, 1.0)
+        k = int(min(GRID_EXT_H_MAX, np.ceil(need)))
+        if k <= 0:
+            continue
+        ext[side] = k
+        for _ in range(k):
+            if side == 0:
+                px = np.hstack([2 * px[:, :1] - px[:, 1:2], px])
+                py = np.hstack([2 * py[:, :1] - py[:, 1:2], py])
+            else:
+                px = np.hstack([px, 2 * px[:, -1:] - px[:, -2:-1]])
+                py = np.hstack([py, 2 * py[:, -1:] - py[:, -2:-1]])
+    return px.astype(np.float32), py.astype(np.float32), ext[0], ext[1]
 
 
 def extend_grid_v(g, n):
@@ -518,7 +605,66 @@ def trim_rect(img, max_frac=0.06):
     bt = max(bt, tex(rowb[::-1], row_gy[::-1], row_gx[::-1], lim_h))
     l = max(l, tex(colb, col_gx, col_gy, lim_w))
     r = max(r, tex(colb[::-1], col_gx[::-1], col_gy[::-1], lim_w))
+
+    # 3) 페이지 가장자리 띠: 페이지가 들려 밑에 깔린 종이들의 단면·인쇄가 보이거나 옆 페이지 테두리가 들어온 것.
+    #    바깥에서 안으로 훑어 '종이가 아닌 열'(어둡거나 색이 있음)이 이어지다가 흰 여백이 시작되는 곳까지 자른다.
+    #    띠 안에 글자가 있으면(색 상자 안 글 등) 자르지 않는다.
+    paper = float(np.percentile(g, 70))
+    if img.ndim == 3:
+        lab = cv2.cvtColor(cv2.resize(img, (sw, sh), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2LAB).astype(np.float32)
+        # 종이 색은 조명 때문에 자리마다 조금씩 다르다 → 종이 픽셀의 a/b 를 넓게 평균한 '그 자리 종이 색' 기준 채도
+        pp = (g >= paper * 0.9).astype(np.float32)
+        sig = max(sw, sh) * 0.12
+        den = cv2.GaussianBlur(pp, (0, 0), sig) + 1e-3
+        a_l = cv2.GaussianBlur(lab[..., 1] * pp, (0, 0), sig) / den
+        b_l = cv2.GaussianBlur(lab[..., 2] * pp, (0, 0), sig) / den
+        chroma = np.hypot(lab[..., 1] - a_l, lab[..., 2] - b_l)
+    else:
+        chroma = np.zeros_like(g)
+    txt = _text_mask_for_grid(cv2.resize(img, (sw, sh), interpolation=cv2.INTER_AREA)) if img.ndim == 3 else np.zeros_like(g8)
+    med_c = np.median(g[r0:r1], axis=0) / paper
+    chr_c = np.median(chroma[r0:r1], axis=0)
+    txt_c = txt[r0:r1].mean(axis=0)
+    med_r = np.median(g[:, c0:c1], axis=1) / paper
+    chr_r = np.median(chroma[:, c0:c1], axis=1)
+    txt_r = txt[:, c0:c1].mean(axis=1)
+
+    def band(med, chr_, txt_, limit, run):
+        """바깥(0)에서 안으로: limit 안의 마지막 '확실히 종이가 아닌 열'(어둡거나 색이 있음) 뒤에
+        흰 여백이 run 만큼 이어지기 시작하는 위치. 밑에 깔린 종이의 흰 단면이 먼저 보여도 그 뒤의 띠까지 자른다"""
+        page = (med >= EDGE_PAPER_MIN) & (chr_ <= EDGE_PAPER_CHROMA)
+        n = len(page)
+        # 바깥에서 안으로, 흰 여백이 run 만큼 이어지는 첫 자리까지가 띠 후보
+        i = 0
+        while i < min(limit, n - run) and not page[i:i + run].all():
+            i += 1
+        if i == 0 or i >= limit or i >= n - run:
+            return 0
+        # 띠 후보 안에 확실히 종이가 아닌 열이 run 폭 이상 이어져야 (인쇄된 괘선 한 줄은 두세 픽셀뿐이라 제외)
+        st = ((med[:i] < EDGE_BAND_DARK) | (chr_[:i] > EDGE_BAND_CHROMA)).astype(np.float32)
+        dens = np.convolve(st, np.ones(run), mode="same") / run
+        if dens.max() < 0.6:
+            return 0
+        if txt_[:i].mean() > EDGE_BAND_TEXT:  # 띠 안에 글자가 있음(색 상자 안 글 등)
+            return 0
+        # 확실한 띠가 끝나는 곳까지만 자른다 (살짝 그늘진 여백은 남겨 글이 가장자리에 붙지 않게)
+        return int(np.flatnonzero(st > 0)[-1]) + 1 + run // 3
+
+    run_w, run_h = max(3, int(sw * 0.015)), max(3, int(sh * 0.015))
+    lim_e_w, lim_e_h = int(sw * EDGE_BAND_MAX), int(sh * EDGE_BAND_MAX)
+    l = max(l, band(med_c, chr_c, txt_c, lim_e_w, run_w))
+    r = max(r, band(med_c[::-1], chr_c[::-1], txt_c[::-1], lim_e_w, run_w))
+    t = max(t, band(med_r, chr_r, txt_r, lim_e_h, run_h))
+    bt = max(bt, band(med_r[::-1], chr_r[::-1], txt_r[::-1], lim_e_h, run_h))
     return int(round(t / s)), int(round(bt / s)), int(round(l / s)), int(round(r / s))
+
+
+EDGE_PAPER_MIN = 0.95     # 열의 중앙값 밝기가 종이의 이 비율 이상이고
+EDGE_PAPER_CHROMA = 2.5   # 색이 이보다 옅으면 '페이지 여백'
+EDGE_BAND_DARK = 0.85     # 띠 안에 이보다 어둡거나
+EDGE_BAND_CHROMA = 4.0    # 이보다 색이 진한 열이 하나라도 있어야 진짜 띠
+EDGE_BAND_TEXT = 0.02     # 띠 안 글자 픽셀 비율이 이보다 크면 자르지 않음 (글이 있는 단은 0.05 이상)
+EDGE_BAND_MAX = 0.15      # 띠 최대 폭(비율)
 
 
 STREAK_RATIO = 2.2
@@ -805,6 +951,67 @@ def local_ink_level(gs, paper, chroma_s=None, glare=None):
     return lv, ref, smax
 
 
+SHARP_REF = 0.37          # 선명한 사진의 글자 가장자리 선명도(기울기/대비). 이보다 낮으면 흐린 것
+SHARP_SPAN = 0.13         # 선명도가 SHARP_REF - SHARP_SPAN 이면 최대로 선명하게
+PRE_SHARPEN_MAX = 2.5     # 언샤프 최대 세기
+PRE_SHARPEN_SIGMA_CH = 0.1  # 언샤프 반경 = 글자 높이 × 이 값 (1~2.5px)
+SHARP_CELL = 1.0 / 10     # 선명도 지도의 칸 크기(페이지 폭 비율)
+SHARP_MIN_EDGE = 300      # 칸에 글자 가장자리 픽셀이 이보다 적으면 비움
+
+
+def local_sharpness(g):
+    """
+    글자 가장자리 선명도 지도(g 크기, float): 칸마다 글자 덩어리 가장자리 픽셀의 기울기 크기(상위 25%)를
+    (종이 밝기 − 글자 검정)으로 나눈 값. 선명하면 0.37 안팎, 흐리면 0.25 아래. 글자가 없는 칸은 이웃에서 메움.
+    반환: (지도, 글자 높이 px) 또는 (None, None)
+    """
+    h, w = g.shape
+    g8 = np.clip(g, 0, 255).astype(np.uint8)
+    block = max(15, int(min(h, w) * 0.03)) | 1
+    m = cv2.adaptiveThreshold(g8, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, block, 12)
+    n, lbl, st, _ = cv2.connectedComponentsWithStats(m, 8)
+    if n < 2:
+        return None, None
+    hs, ws = st[:, cv2.CC_STAT_HEIGHT], st[:, cv2.CC_STAT_WIDTH]
+    okc = (hs >= 4) & (hs < h * 0.05) & (ws < w * 0.1)
+    okc[0] = False
+    if okc.sum() < 30:
+        return None, None
+    ch = float(np.median(hs[okc]))
+    keep = (hs >= 0.5 * ch) & (hs <= 2.5 * ch) & (ws <= 8 * ch)
+    keep[0] = False
+    gm = keep[lbl].astype(np.uint8)
+    edge = (cv2.dilate(gm, np.ones((3, 3), np.uint8)) > 0) & (cv2.erode(gm, np.ones((3, 3), np.uint8)) == 0)
+    gx = cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3)
+    mag = np.hypot(gx, gy) / 8.0
+    paper = float(np.percentile(g, 60))
+    cell = max(16, int(round(w * SHARP_CELL)))
+    gh, gw = (h + cell - 1) // cell, (w + cell - 1) // cell
+    val = np.zeros((gh, gw), np.float32)
+    ok = np.zeros((gh, gw), np.float32)
+    for r in range(gh):
+        for c in range(gw):
+            sl = (slice(r * cell, min(h, (r + 1) * cell)), slice(c * cell, min(w, (c + 1) * cell)))
+            e = edge[sl]
+            if int(e.sum()) < SHARP_MIN_EDGE:
+                continue
+            core = float(np.percentile(g[sl][gm[sl] > 0], 10))
+            if paper - core < 30:
+                continue
+            val[r, c] = float(np.percentile(mag[sl][e], 75)) / (paper - core)
+            ok[r, c] = 1.0
+    if ok.sum() < 1:
+        return None, None
+    ref = float(np.median(val[ok > 0]))
+    num = cv2.GaussianBlur(val * ok, (0, 0), 1.0, borderType=cv2.BORDER_REPLICATE)
+    den = cv2.GaussianBlur(ok, (0, 0), 1.0, borderType=cv2.BORDER_REPLICATE)
+    sm = np.where(den > 0.05, num / np.maximum(den, 1e-6), ref).astype(np.float32)
+    sm = sm * np.minimum(den / 0.3, 1.0) + ref * (1.0 - np.minimum(den / 0.3, 1.0))
+    sm = cv2.resize(sm, (gw * cell, gh * cell), interpolation=cv2.INTER_LINEAR)[:h, :w]
+    return sm, ch
+
+
 def tone_map(norm, bg=None):
     """
     조명 평탄화된 float 이미지 → 종이는 흰색, 글자는 원래 모양(가장자리의 부드러운 회색 포함) 그대로 진하게.
@@ -820,6 +1027,14 @@ def tone_map(norm, bg=None):
     g = cv2.cvtColor(n8, cv2.COLOR_BGR2GRAY).astype(np.float32) if color else n8.astype(np.float32)
     g0 = g
     h, w = g.shape
+    # ---- 초점이 흐린 곳 선명하게: 글자 가장자리의 기울기(선명도)를 자리마다 재서, 흐린 곳일수록 강하게 언샤프
+    #      (흐려진 획은 넓고 옅다. 대비만 키우면 굵고 뭉개진 글자가 되므로 먼저 획을 좁혀 세운다)
+    sh_map, ch_px = local_sharpness(g)
+    if sh_map is not None:
+        amt = np.clip((SHARP_REF - sh_map) / SHARP_SPAN, 0, 1) * PRE_SHARPEN_MAX
+        if float(amt.max()) > 0.05:
+            sig = float(np.clip(PRE_SHARPEN_SIGMA_CH * ch_px, 1.0, 2.5))
+            g = np.clip(g + (g - cv2.GaussianBlur(g, (0, 0), sig)) * amt, 0, 255)
     s = min(1.0, 1000.0 / max(h, w))
     gs = cv2.resize(g, None, fx=s, fy=s, interpolation=cv2.INTER_AREA) if s < 1 else g
     paper = float(np.percentile(gs, PAPER_PCT))

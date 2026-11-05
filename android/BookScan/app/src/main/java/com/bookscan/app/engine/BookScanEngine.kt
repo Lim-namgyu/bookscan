@@ -210,15 +210,17 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
      *  2) 남은 부분 중 마스크 바깥은 주변 종이색으로 메운다(손가락 메우기와 같은 방법) → 보정 후 흰색.
      * 마스크 경계가 거칠어(320 격자) 조금 안쪽으로 줄여서 쓴다. 페이지 여백은 비어 있어 손실 없음.
      */
-    private fun applyPageMask(flat: Mat, pm: Mat): Mat? {
+    private fun applyPageMask(flat: Mat, pm: Mat, erode: Boolean = true): Mat? {
         val h = pm.rows()
         val w = pm.cols()
         val inside = Mat()
         Imgproc.threshold(pm, inside, 127.0, 255.0, Imgproc.THRESH_BINARY)
         try {
             if (Core.countNonZero(inside) < 0.3 * w * h) return null // 마스크가 이상하면 손대지 않음
-            val e = max(3, (min(h, w) * PAGE_MASK_ERODE).toInt()) or 1
-            Imgproc.erode(inside, inside, ellipse(e))
+            if (erode) {
+                val e = max(3, (min(h, w) * PAGE_MASK_ERODE).toInt()) or 1
+                Imgproc.erode(inside, inside, ellipse(e))
+            }
             val ib = ByteArray(w * h).also { inside.get(0, 0, it) }
             val colc = IntArray(w)
             val rowc = IntArray(h)
@@ -333,14 +335,23 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         val scale = min(1.15, sqrt(w.toDouble() * h / max(ow * oh, 1.0)))
         // 모델이 잡은 페이지 경계가 머리글·쪽번호에 바짝 붙는 경우가 있어, 격자를 위아래로 한 칸씩 연장.
         // 좌우는 연장하지 않는다(책 옆면 띠가 들어오면 그 위의 손가락과 엉겨 손가락 찾기가 어려워짐).
-        val pxE = extendGridV(gx, GRID_EXT)
-        val pyE = extendGridV(gy, GRID_EXT)
+        var pxE = extendGridV(gx, GRID_EXT)
+        var pyE = extendGridV(gy, GRID_EXT)
         px.release(); py.release()
         val ghE = GRID_H + 2 * GRID_EXT
-        px = Mat(ghE, GRID_W, CvType.CV_32F).also { it.put(0, 0, pxE) }
-        py = Mat(ghE, GRID_W, CvType.CV_32F).also { it.put(0, 0, pyE) }
+        // 모델이 잡은 좌우 경계가 글자를 가로지르면(페이지가 사진 밖으로 잘렸거나 경계를 안쪽에 잡음) 그쪽으로 연장
+        val (extL, extR) = extendGridToText(pxE, pyE, ghE, GRID_W, img)
+        var gwE = GRID_W
+        if (extL + extR > 0) {
+            pxE = extendGridH(pxE, ghE, GRID_W, extL, extR)
+            pyE = extendGridH(pyE, ghE, GRID_W, extL, extR)
+            gwE = GRID_W + extL + extR
+        }
+        px = Mat(ghE, gwE, CvType.CV_32F).also { it.put(0, 0, pxE) }
+        py = Mat(ghE, gwE, CvType.CV_32F).also { it.put(0, 0, pyE) }
         oh = oh * (ghE - 1.0) / (GRID_H - 1.0)
-        val outW = max(16, rint(ow * scale))
+        val owE = ow * (gwE - 1.0) / (GRID_W - 1.0)
+        val outW = max(16, rint(owE * scale))
         val outH = max(16, rint(oh * scale))
 
         // ---- 분석용 작은 페이지 (긴 변 ANALYSIS_SIDE)
@@ -410,17 +421,129 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
             pmOut = Mat()
             Imgproc.remap(mask, pmOut, fx, fy, Imgproc.INTER_LINEAR, Core.BORDER_CONSTANT, Scalar(0.0))
         }
+        // 사진 밖(격자를 사진 끝 너머로 연장한 곳)은 가장자리 픽셀이 늘어나 줄무늬가 되므로 페이지 밖으로 본다
+        val inX = Mat()
+        val inY = Mat()
+        Core.inRange(fx, Scalar(0.0), Scalar(w - 1.0), inX)
+        Core.inRange(fy, Scalar(0.0), Scalar(h - 1.0), inY)
         fx.release(); fy.release()
+        Core.bitwise_and(inX, inY, inX)
+        inY.release()
+        val k5 = Mat.ones(5, 5, CvType.CV_8UC1)
+        Imgproc.erode(inX, inX, k5)
+        k5.release()
+        val hasOutside = Core.countNonZero(inX) < inX.total()
+        if (hasOutside) {
+            if (pmOut == null) pmOut = inX else {
+                Core.min(pmOut, inX, pmOut); inX.release()
+            }
+        } else {
+            inX.release()
+        }
         val (t2, b2, l2, r2) = trimRect(out)
         val roi = Rect(l2, t2, out.cols() - l2 - r2, out.rows() - t2 - b2)
         val trimmed = if (t2 + b2 + l2 + r2 == 0) out else out.cropClone(roi).also { out.release() }
         if (pmOut == null) return trimmed
         val pmT = if (t2 + b2 + l2 + r2 == 0) pmOut else pmOut.cropClone(roi).also { pmOut.release() }
-        val masked = applyPageMask(trimmed, pmT)
+        val masked = applyPageMask(trimmed, pmT, erode = mask != null)
         pmT.release()
         if (masked == null) return trimmed
         trimmed.release()
         return masked
+    }
+
+    /** bookscan._text_components: 글자 크기 덩어리의 상자 [x, y, w, h] (원본 좌표). 큰 덩어리(그림·상자)는 제외 */
+    private fun textComponentBoxes(img: Mat): List<DoubleArray> {
+        val h = img.rows()
+        val w = img.cols()
+        val s = 1000.0 / max(h, w)
+        val small = Mat()
+        if (s < 1.0) Imgproc.resize(img, small, Size(0.0, 0.0), s, s, Imgproc.INTER_AREA) else img.copyTo(small)
+        val g = Mat()
+        if (small.channels() == 3) Imgproc.cvtColor(small, g, Imgproc.COLOR_RGB2GRAY) else small.copyTo(g)
+        small.release()
+        val block = max(15, (min(g.rows(), g.cols()) * 0.03).toInt()) or 1
+        val m = Mat()
+        Imgproc.adaptiveThreshold(g, m, 255.0, Imgproc.ADAPTIVE_THRESH_MEAN_C, Imgproc.THRESH_BINARY_INV, block, 12.0)
+        val lbl = Mat()
+        val st = Mat()
+        val cen = Mat()
+        val n = Imgproc.connectedComponentsWithStats(m, lbl, st, cen, 8, CvType.CV_32S)
+        val stats = IntArray(n * 5).also { st.get(0, 0, it) }
+        listOf(g, m, lbl, st, cen).forEach { it.release() }
+        val gh = (h * s).roundToInt().coerceAtLeast(1)
+        val gw = (w * s).roundToInt().coerceAtLeast(1)
+        val out = ArrayList<DoubleArray>()
+        val sc = if (s < 1.0) 1.0 / s else 1.0
+        for (i in 1 until n) {
+            val hh = stats[i * 5 + Imgproc.CC_STAT_HEIGHT]
+            val ww = stats[i * 5 + Imgproc.CC_STAT_WIDTH]
+            if (hh >= 3 && hh <= gh * 0.03 && ww <= gw * 0.06) {
+                out.add(doubleArrayOf(stats[i * 5] * sc, stats[i * 5 + 1] * sc, ww * sc, hh * sc))
+            }
+        }
+        return out
+    }
+
+    /**
+     * bookscan.extend_grid_to_text: 격자의 왼쪽/오른쪽 경계선이 글자를 가로지르면(경계 양쪽에 걸친 글자 덩어리가
+     * 여러 글줄에 걸쳐 있음) 그쪽으로 연장할 칸 수. 반환: (왼쪽, 오른쪽)
+     */
+    private fun extendGridToText(px: FloatArray, py: FloatArray, rows: Int, cols: Int, img: Mat): Pair<Int, Int> {
+        val h = img.rows()
+        val w = img.cols()
+        var boxes: List<DoubleArray>? = null
+        val ext = intArrayOf(0, 0)
+        for (side in 0..1) {
+            val c = if (side == 0) 0 else cols - 1
+            val bx = DoubleArray(rows) { px[it * cols + c].toDouble() }
+            val by = DoubleArray(rows) { py[it * cols + c].toDouble() }
+            if (boxes == null) {
+                boxes = textComponentBoxes(img)
+                if (boxes.isEmpty()) break
+            }
+            val order = by.indices.sortedBy { by[it] }
+            val bys = DoubleArray(rows) { by[order[it]] }
+            val bxs = DoubleArray(rows) { bx[order[it]] }
+            var nStr = 0
+            var rMin = Double.MAX_VALUE
+            var rMax = -Double.MAX_VALUE
+            for (b in boxes) {
+                val cy = b[1] + b[3] / 2.0
+                val xb = Straightener.interpPublic(cy, bys, bxs)
+                if (b[0] < xb - 1.0 && b[0] + b[2] > xb + 1.0 && b[2] >= 3) {
+                    nStr++; rMin = min(rMin, cy); rMax = max(rMax, cy)
+                }
+            }
+            if (nStr < EXT_STRADDLE_MIN || rMax - rMin < h * 0.15) continue
+            val need: Double
+            if (side == 0) {
+                var step = 0.0
+                for (r in 0 until rows) step += abs(px[r * cols] - px[r * cols + 1])
+                step /= rows
+                need = bx.max() / max(step, 1.0)
+            } else {
+                var step = 0.0
+                for (r in 0 until rows) step += abs(px[r * cols + cols - 1] - px[r * cols + cols - 2])
+                step /= rows
+                need = (w - 1 - bx.min()) / max(step, 1.0)
+            }
+            val k = min(GRID_EXT_H_MAX.toDouble(), ceil(need)).toInt()
+            if (k > 0) ext[side] = k
+        }
+        return Pair(ext[0], ext[1])
+    }
+
+    /** 격자를 좌우로 직선 연장 (가장자리 두 열의 차이만큼 계속) */
+    private fun extendGridH(g: FloatArray, rows: Int, cols: Int, left: Int, right: Int): FloatArray {
+        val nc = cols + left + right
+        val out = FloatArray(rows * nc)
+        for (r in 0 until rows) {
+            for (c in 0 until cols) out[r * nc + left + c] = g[r * cols + c]
+            for (j in 1..left) out[r * nc + left - j] = g[r * cols] + j * (g[r * cols] - g[r * cols + 1])
+            for (j in 1..right) out[r * nc + left + cols - 1 + j] = g[r * cols + cols - 1] + j * (g[r * cols + cols - 1] - g[r * cols + cols - 2])
+        }
+        return out
     }
 
     /**
@@ -585,6 +708,99 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         bt = max(bt, tex({ rowb[sh - 1 - it] }, { rowGy[sh - 1 - it] }, { rowGx[sh - 1 - it] }, sh, limH2))
         l = max(l, tex({ colb[it] }, { colGx[it] }, { colGy[it] }, sw, limW2))
         r = max(r, tex({ colb[sw - 1 - it] }, { colGx[sw - 1 - it] }, { colGy[sw - 1 - it] }, sw, limW2))
+
+        // 3) 페이지 가장자리 띠: 페이지가 들려 밑에 깔린 종이들의 단면·인쇄가 보이거나 옆 페이지 테두리가 들어온 것.
+        //    바깥에서 안으로 훑어 '종이가 아닌 열'(어둡거나 색이 있음)이 이어지다가 흰 여백이 시작되는 곳까지 자른다.
+        //    띠 안에 글자가 있으면(색 상자 안 글 등) 자르지 않는다.
+        val paper = percentileByHistogram(g, 70.0)
+        val chroma = FloatArray(sh * sw)
+        val txt = ByteArray(sh * sw)
+        if (img.channels() == 3) {
+            val smallC = Mat()
+            Imgproc.resize(img, smallC, Size(sw.toDouble(), sh.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
+            val lab = Mat()
+            Imgproc.cvtColor(smallC, lab, Imgproc.COLOR_RGB2Lab)
+            // 종이 색은 조명 때문에 자리마다 조금씩 다르다 → 종이 픽셀의 a/b 를 넓게 평균한 '그 자리 종이 색' 기준 채도
+            val ch = ArrayList<Mat>()
+            Core.split(lab, ch)
+            lab.release()
+            val pp = Mat(sh, sw, CvType.CV_32F).also { m -> m.put(0, 0, FloatArray(sh * sw) { if (all[it] >= paper * 0.9) 1f else 0f }) }
+            val sig = max(sw, sh) * 0.12
+            val den = Mat()
+            Imgproc.GaussianBlur(pp, den, Size(0.0, 0.0), sig)
+            Core.add(den, Scalar(1e-3), den)
+            val aF = Mat(); val bF = Mat()
+            ch[1].convertTo(aF, CvType.CV_32F); ch[2].convertTo(bF, CvType.CV_32F)
+            ch.forEach { it.release() }
+            val aL = Mat(); val bL = Mat()
+            Core.multiply(aF, pp, aL); Core.multiply(bF, pp, bL)
+            Imgproc.GaussianBlur(aL, aL, Size(0.0, 0.0), sig); Imgproc.GaussianBlur(bL, bL, Size(0.0, 0.0), sig)
+            Core.divide(aL, den, aL); Core.divide(bL, den, bL)
+            Core.subtract(aF, aL, aF); Core.subtract(bF, bL, bF)
+            Core.magnitude(aF, bF, aF)
+            aF.get(0, 0, chroma)
+            listOf(pp, den, aF, bF, aL, bL).forEach { it.release() }
+            // 글자 마스크(글자 크기 덩어리)
+            val gS = Mat()
+            Imgproc.cvtColor(smallC, gS, Imgproc.COLOR_RGB2GRAY)
+            smallC.release()
+            val block = max(15, (min(sh, sw) * 0.03).toInt()) or 1
+            val m = Mat()
+            Imgproc.adaptiveThreshold(gS, m, 255.0, Imgproc.ADAPTIVE_THRESH_MEAN_C, Imgproc.THRESH_BINARY_INV, block, 12.0)
+            gS.release()
+            val lbl = Mat(); val st = Mat(); val cen = Mat()
+            val n = Imgproc.connectedComponentsWithStats(m, lbl, st, cen, 8, CvType.CV_32S)
+            m.release(); cen.release()
+            val stats = IntArray(n * 5).also { st.get(0, 0, it) }
+            st.release()
+            val labels = IntArray(sh * sw).also { lbl.get(0, 0, it) }
+            lbl.release()
+            val keep = BooleanArray(n) { i ->
+                i != 0 && stats[i * 5 + 3] >= 3 && stats[i * 5 + 3] <= sh * 0.03 && stats[i * 5 + 2] <= sw * 0.06
+            }
+            for (i in 0 until sh * sw) if (keep[labels[i]]) txt[i] = 1
+        }
+        val medC = DoubleArray(sw) { x -> median(DoubleArray(r1 - r0) { all[(r0 + it) * sw + x] }) / paper }
+        val chrC = DoubleArray(sw) { x -> median(DoubleArray(r1 - r0) { chroma[(r0 + it) * sw + x].toDouble() }) }
+        val txtC = DoubleArray(sw) { x -> var c = 0; for (y in r0 until r1) c += txt[y * sw + x]; c.toDouble() / max(1, r1 - r0) }
+        val medR = DoubleArray(sh) { y -> median(DoubleArray(c1 - c0) { all[y * sw + c0 + it] }) / paper }
+        val chrR = DoubleArray(sh) { y -> median(DoubleArray(c1 - c0) { chroma[y * sw + c0 + it].toDouble() }) }
+        val txtR = DoubleArray(sh) { y -> var c = 0; for (x in c0 until c1) c += txt[y * sw + x]; c.toDouble() / max(1, c1 - c0) }
+        /** 바깥(0)에서 안으로: 흰 여백이 run 만큼 이어지는 첫 자리까지가 띠 후보. 띠 안에 확실히 종이가 아닌 열이
+         *  run 폭 이상 이어져야 하고 글자가 없어야 한다. 확실한 띠가 끝나는 곳(+여유)까지만 자른다 */
+        fun band(med: (Int) -> Double, chr: (Int) -> Double, tx: (Int) -> Double, n: Int, limit: Int, run: Int): Int {
+            fun page(i: Int) = med(i) >= EDGE_PAPER_MIN && chr(i) <= EDGE_PAPER_CHROMA
+            var i = 0
+            while (i < min(limit, n - run)) {
+                var all = true
+                for (j in i until i + run) if (!page(j)) { all = false; break }
+                if (all) break
+                i++
+            }
+            if (i == 0 || i >= limit || i >= n - run) return 0
+            val st = IntArray(i) { if (med(it) < EDGE_BAND_DARK || chr(it) > EDGE_BAND_CHROMA) 1 else 0 }
+            var best = 0.0
+            var last = -1
+            for (c in 0 until i) {
+                var cnt = 0
+                for (j in c - run / 2 until c - run / 2 + run) if (j in 0 until i && st[j] == 1) cnt++
+                best = max(best, cnt.toDouble() / run)
+                if (st[c] == 1) last = c
+            }
+            if (best < 0.6) return 0
+            var tsum = 0.0
+            for (j in 0 until i) tsum += tx(j)
+            if (tsum / i > EDGE_BAND_TEXT) return 0
+            return last + 1 + run / 3
+        }
+        val runW = max(3, (sw * 0.015).toInt())
+        val runH = max(3, (sh * 0.015).toInt())
+        val limEW = (sw * EDGE_BAND_MAX).toInt()
+        val limEH = (sh * EDGE_BAND_MAX).toInt()
+        l = max(l, band({ medC[it] }, { chrC[it] }, { txtC[it] }, sw, limEW, runW))
+        r = max(r, band({ medC[sw - 1 - it] }, { chrC[sw - 1 - it] }, { txtC[sw - 1 - it] }, sw, limEW, runW))
+        t = max(t, band({ medR[it] }, { chrR[it] }, { txtR[it] }, sh, limEH, runH))
+        bt = max(bt, band({ medR[sh - 1 - it] }, { chrR[sh - 1 - it] }, { txtR[sh - 1 - it] }, sh, limEH, runH))
         return Trim(rint(t / s), rint(bt / s), rint(l / s), rint(r / s))
     }
 
@@ -1030,12 +1246,151 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
      *  - 밝기만 바꾸고 색은 같은 비율로 유지(색 상자·그림 보존)
      * 입력이 RGB 면 RGB, 1채널이면 1채널(8비트)을 돌려준다. 메모리를 아끼려 큰 계산은 1채널로.
      */
+    /**
+     * bookscan.local_sharpness: 글자 가장자리 선명도 지도(칸 단위 Mat CV_32F, (gw*cell) x (gh*cell) 를 원본 크기로 자른 것).
+     * 칸마다 글자 덩어리 가장자리 픽셀의 기울기(상위 25%)를 (종이 밝기 − 글자 검정)으로 나눈 값.
+     * 선명하면 0.37 안팎, 흐리면 0.25 아래. 글자가 없는 칸은 이웃에서 메움. 반환: (지도, 글자 높이 px) 또는 (null, 0)
+     */
+    private fun localSharpness(g8: Mat, gF: Mat): Pair<Mat?, Double> {
+        val h = g8.rows()
+        val w = g8.cols()
+        val block = max(15, (min(h, w) * 0.03).toInt()) or 1
+        val m = Mat()
+        Imgproc.adaptiveThreshold(g8, m, 255.0, Imgproc.ADAPTIVE_THRESH_MEAN_C, Imgproc.THRESH_BINARY_INV, block, 12.0)
+        val lbl = Mat()
+        val st = Mat()
+        val cen = Mat()
+        val n = Imgproc.connectedComponentsWithStats(m, lbl, st, cen, 8, CvType.CV_32S)
+        m.release(); cen.release()
+        if (n < 2) {
+            lbl.release(); st.release(); return Pair(null, 0.0)
+        }
+        val stats = IntArray(n * 5).also { st.get(0, 0, it) }
+        st.release()
+        val hsOk = ArrayList<Float>()
+        for (i in 1 until n) {
+            val hh = stats[i * 5 + 3]
+            val ww = stats[i * 5 + 2]
+            if (hh >= 4 && hh < h * 0.05 && ww < w * 0.1) hsOk.add(hh.toFloat())
+        }
+        if (hsOk.size < 30) {
+            lbl.release(); return Pair(null, 0.0)
+        }
+        val ch = percentile(hsOk.toFloatArray(), 50.0).toDouble()
+        val keep = BooleanArray(n) { i ->
+            i != 0 && stats[i * 5 + 3] >= 0.5 * ch && stats[i * 5 + 3] <= 2.5 * ch && stats[i * 5 + 2] <= 8 * ch
+        }
+        val labels = IntArray(h * w).also { lbl.get(0, 0, it) }
+        lbl.release()
+        val gmB = ByteArray(h * w) { if (keep[labels[it]]) 1 else 0 }
+        val gmM = Mat(h, w, CvType.CV_8UC1).also { it.put(0, 0, gmB) }
+        val dil = Mat()
+        val ero = Mat()
+        val k3 = Mat.ones(3, 3, CvType.CV_8UC1)
+        Imgproc.dilate(gmM, dil, k3)
+        Imgproc.erode(gmM, ero, k3)
+        k3.release(); gmM.release()
+        val dB = ByteArray(h * w).also { dil.get(0, 0, it) }
+        val eB = ByteArray(h * w).also { ero.get(0, 0, it) }
+        dil.release(); ero.release()
+        val gx = Mat()
+        val gy = Mat()
+        Imgproc.Sobel(gF, gx, CvType.CV_32F, 1, 0, 3)
+        Imgproc.Sobel(gF, gy, CvType.CV_32F, 0, 1, 3)
+        Core.magnitude(gx, gy, gx)
+        gy.release()
+        val mag = FloatArray(h * w).also { gx.get(0, 0, it) }
+        gx.release()
+        val gA = FloatArray(h * w).also { gF.get(0, 0, it) }
+        val paper = percentile(gA, 60.0).toDouble()
+        val cell = max(16, (w * SHARP_CELL).roundToInt())
+        val gh = (h + cell - 1) / cell
+        val gw = (w + cell - 1) / cell
+        val valA = FloatArray(gh * gw)
+        val okA = FloatArray(gh * gw)
+        val edgeBuf = FloatArray(cell * cell)
+        val coreBuf = FloatArray(cell * cell)
+        for (r in 0 until gh) for (c in 0 until gw) {
+            val y0 = r * cell; val y1 = min(h, y0 + cell); val x0 = c * cell; val x1 = min(w, x0 + cell)
+            var ne = 0
+            var ng = 0
+            for (y in y0 until y1) for (x in x0 until x1) {
+                val i = y * w + x
+                if (gmB[i].toInt() != 0) coreBuf[ng++] = gA[i]
+                if (dB[i].toInt() != 0 && eB[i].toInt() == 0) edgeBuf[ne++] = mag[i] / 8f
+            }
+            if (ne < SHARP_MIN_EDGE || ng == 0) continue
+            val core = percentile(coreBuf.copyOf(ng), 10.0).toDouble()
+            if (paper - core < 30) continue
+            valA[r * gw + c] = (percentile(edgeBuf.copyOf(ne), 75.0) / (paper - core)).toFloat()
+            okA[r * gw + c] = 1f
+        }
+        var okSum = 0f
+        for (v in okA) okSum += v
+        if (okSum < 1f) return Pair(null, 0.0)
+        val valid = ArrayList<Float>()
+        for (i in okA.indices) if (okA[i] > 0) valid.add(valA[i])
+        val ref = percentile(valid.toFloatArray(), 50.0)
+        val num = Mat(gh, gw, CvType.CV_32F).also { it.put(0, 0, FloatArray(gh * gw) { valA[it] * okA[it] }) }
+        val den = Mat(gh, gw, CvType.CV_32F).also { it.put(0, 0, okA) }
+        Imgproc.GaussianBlur(num, num, Size(0.0, 0.0), 1.0, 1.0, Core.BORDER_REPLICATE)
+        Imgproc.GaussianBlur(den, den, Size(0.0, 0.0), 1.0, 1.0, Core.BORDER_REPLICATE)
+        val nA = FloatArray(gh * gw).also { num.get(0, 0, it) }
+        val dA = FloatArray(gh * gw).also { den.get(0, 0, it) }
+        den.release()
+        val smA = FloatArray(gh * gw) { i ->
+            val d = dA[i]
+            val v = if (d > 0.05f) nA[i] / max(d, 1e-6f) else ref
+            val wgt = min(d / 0.3f, 1f)
+            v * wgt + ref * (1f - wgt)
+        }
+        num.put(0, 0, smA)
+        val up = Mat()
+        Imgproc.resize(num, up, Size((gw * cell).toDouble(), (gh * cell).toDouble()), 0.0, 0.0, Imgproc.INTER_LINEAR)
+        num.release()
+        val out = up.cropClone(0, h, 0, w)
+        up.release()
+        return Pair(out, ch)
+    }
+
     private fun toneMap(norm: Mat, bgSmall: Mat? = null): Mat {
         val color = norm.channels() == 3
         val h = norm.rows()
         val w = norm.cols()
         var g8 = Mat()
         if (color) Imgproc.cvtColor(norm, g8, Imgproc.COLOR_RGB2GRAY) else norm.copyTo(g8)
+        val gF0 = Mat()
+        g8.convertTo(gF0, CvType.CV_32F) // 원래 밝기 (색 처리에서 L + (y - g) 의 g)
+        // ---- 초점이 흐린 곳 선명하게: 글자 가장자리의 기울기(선명도)를 자리마다 재서, 흐린 곳일수록 강하게 언샤프
+        //      (흐려진 획은 넓고 옅다. 대비만 키우면 굵고 뭉개진 글자가 되므로 먼저 획을 좁혀 세운다)
+        run {
+            val (shM, chPx) = localSharpness(g8, gF0)
+            if (shM != null) {
+                val amt = Mat()
+                Imgproc.resize(shM, amt, Size(w.toDouble(), h.toDouble()), 0.0, 0.0, Imgproc.INTER_LINEAR)
+                shM.release()
+                amt.convertTo(amt, CvType.CV_32F, -1.0 / SHARP_SPAN, SHARP_REF / SHARP_SPAN)
+                Core.max(amt, Scalar(0.0), amt)
+                Core.min(amt, Scalar(1.0), amt)
+                Core.multiply(amt, Scalar(PRE_SHARPEN_MAX), amt)
+                val mm = Core.minMaxLoc(amt)
+                if (mm.maxVal > 0.05) {
+                    val sig = (PRE_SHARPEN_SIGMA_CH * chPx).coerceIn(1.0, 2.5)
+                    val gS = Mat()
+                    Imgproc.GaussianBlur(gF0, gS, Size(0.0, 0.0), sig)
+                    Core.subtract(gF0, gS, gS)
+                    Core.multiply(gS, amt, gS)
+                    Core.add(gF0, gS, gS)
+                    Core.max(gS, Scalar(0.0), gS)
+                    Core.min(gS, Scalar(255.0), gS)
+                    g8.release()
+                    g8 = Mat()
+                    gS.convertTo(g8, CvType.CV_8U)
+                    gS.release()
+                }
+                amt.release()
+            }
+        }
         // 종이 밝기·검정 기준 (긴 변 1000px)
         val s = min(1.0, 1000.0 / max(h, w))
         val gsM = Mat()
@@ -1090,9 +1445,9 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         }
         val loc = localInkLevel(gsM, gs, paper, chromaS, glare)
         gsM.release()
-        val gF0 = Mat()
-        g8.convertTo(gF0, CvType.CV_32F)
-        var gN = gF0
+        val gFs = Mat()
+        g8.convertTo(gFs, CvType.CV_32F) // 선명하게 한 밝기 (글자 진하기 맞춤의 바탕)
+        var gN = gFs
         if (loc != null) {
             // 종이에서 떨어진 거리를 k 배: 그 칸의 글자 검정(lv)이 전체 글자 검정(ref) 자리로 온다. 옅은 곳만(k ≥ 1)
             val kA = FloatArray(loc.lv.size) { ((paper - loc.ref) / max(paper - loc.lv[it], 1.0)).coerceIn(1.0, loc.smax[it].toDouble()).toFloat() }
@@ -1103,7 +1458,7 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
                 val kFull = Mat()
                 Imgproc.resize(kS, kFull, Size(w.toDouble(), h.toDouble()), 0.0, 0.0, Imgproc.INTER_LINEAR)
                 kS.release()
-                gN = gF0.clone()
+                gN = gFs.clone()
                 // 많이 키우는 곳은 대개 초점이 흐린 곳: 획이 서로 붙지 않게 살짝 선명하게 한 뒤 키운다
                 //   amt = clip((k-1)/2, 0, 1) * LOCAL_SHARPEN ;  g += (g - blur(g)) * amt
                 val amt = Mat()
@@ -1207,7 +1562,8 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         Core.subtract(gN, Scalar(black), t)
         Core.divide(t, wv, t)
         wv.release()
-        if (gN !== gF0) gN.release()
+        if (gN !== gFs) gN.release()
+        gFs.release()
         val gF = gF0 // 원래 밝기 (색 처리에서 L + (y - g) 의 g)
         Core.max(t, Scalar(0.0), t)
         Core.min(t, Scalar(1.0), t)
@@ -1674,6 +2030,13 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         const val LINE_DARK_FRAC = 0.25 // 이만큼은 있어야 인쇄된 선(접힌 자국·그림자 경계는 더 옅고 고름)
         const val INK_NEAR = 0.006      // 글자 근처로 보는 거리(페이지 폭 비율)
         const val CHROMA_KEEP = 8.0     // 종이 색을 뺀 채도가 이보다 진하면(색 상자·그림·색 글씨) 살림
+        // 초점 흐린 곳 선명하게 (engine/bookscan.py SHARP_* / PRE_SHARPEN_* 와 같은 값)
+        const val SHARP_REF = 0.37
+        const val SHARP_SPAN = 0.13
+        const val PRE_SHARPEN_MAX = 2.5
+        const val PRE_SHARPEN_SIGMA_CH = 0.1
+        const val SHARP_CELL = 1.0 / 10
+        const val SHARP_MIN_EDGE = 300
         // 글자 진하기 자리마다 맞춤 (engine/bookscan.py LOCAL_* / GLARE_* 와 같은 값)
         const val LOCAL_CELL = 1.0 / 12
         const val LOCAL_PCT = 5.0
@@ -1707,6 +2070,15 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
 
         /** 모델 격자를 위아래로 연장할 칸 수 */
         const val GRID_EXT = 1
+        const val GRID_EXT_H_MAX = 8      // 좌우로 연장할 최대 칸 수
+        // 페이지 가장자리 띠 (engine/bookscan.py EDGE_PAPER_* / EDGE_BAND_* 와 같은 값)
+        const val EDGE_PAPER_MIN = 0.95
+        const val EDGE_PAPER_CHROMA = 2.5
+        const val EDGE_BAND_DARK = 0.85
+        const val EDGE_BAND_CHROMA = 4.0
+        const val EDGE_BAND_TEXT = 0.02
+        const val EDGE_BAND_MAX = 0.15
+        const val EXT_STRADDLE_MIN = 6    // 경계선 양쪽에 걸친 글자 덩어리가 이보다 많아야 '글자를 가로지른 것'
 
         /** 한 쪽 페이지가 이보다 가로로 길면 세로로 눕혀서 곡면 펴기 */
         const val LANDSCAPE_RATIO = 1.2

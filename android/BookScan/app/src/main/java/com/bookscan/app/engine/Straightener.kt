@@ -1050,6 +1050,9 @@ object Straightener {
         return s
     }
 
+    /** interp 를 다른 엔진 파일에서도 쓸 수 있게 */
+    internal fun interpPublic(x: Double, xs: DoubleArray, ys: DoubleArray): Double = interp(x, xs, ys)
+
     /** 오름차순 xs 에 대한 선형 보간 (numpy.interp 와 같음) */
     private fun interp(x: Double, xs: DoubleArray, ys: DoubleArray): Double {
         if (x <= xs[0]) return ys[0]
