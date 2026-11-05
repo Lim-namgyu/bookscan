@@ -229,6 +229,24 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * 확인용 PDF: 엔진에 넣은 원본 사진 + 결과를 그대로(다시 압축하지 않고) 한 PDF에.
+     * 결과가 이상할 때 이 파일을 보내면 원본 해상도 그대로 확인할 수 있다(사진으로 보내면 줄어듦).
+     */
+    suspend fun exportDiagnosticPdf(page: ScanPage): File? {
+        val raw = page.rawFile ?: return null
+        return withContext(Dispatchers.IO) {
+            val name = "BookScan_확인_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".pdf"
+            val dir = File(app.cacheDir, "exports").apply { mkdirs() }
+            val dest = File(dir, name)
+            val imgs = listOf(raw, page.resultFile).mapNotNull { f ->
+                ImageIO.imageSize(f)?.let { (w, h) -> PdfExporter.Img(f, w, h) }
+            }
+            PdfExporter.write(imgs, dest)
+            dest
+        }
+    }
+
     /** 결과 이미지를 사진 앱(Pictures/BookScan)에 저장 */
     suspend fun saveImagesToGallery(): Int {
         val snapshot = pages.toList()

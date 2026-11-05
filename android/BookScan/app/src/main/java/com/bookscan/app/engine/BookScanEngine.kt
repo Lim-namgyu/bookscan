@@ -15,6 +15,7 @@ import org.opencv.imgproc.Imgproc
 import java.nio.FloatBuffer
 import kotlin.math.abs
 import kotlin.math.ceil
+import kotlin.math.exp
 import kotlin.math.floor
 import kotlin.math.hypot
 import kotlin.math.max
@@ -1353,6 +1354,115 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         return Pair(out, ch)
     }
 
+    /**
+     * bookscan.restore_strokes: 흐려진 획 되살리기. g(CV_32F, 글자 진하기 맞춤이 끝난 밝기)를 받아 새 Mat 을 돌려준다
+     * (바꿀 것이 없으면 g 그대로). loc/kA: 자리마다 글자 검정(lv)과 그 배율(1000px 축척), ink: 글자 후보(8U),
+     * chPx: 글자 높이(0 이면 ink 에서 잼), lwF: 긴 선 가중치(0~1), colored: 색 가중치(0~1, 없으면 null), r: 글자 근처 반경
+     */
+    private fun restoreStrokes(
+        g: Mat, paper: Double, black: Double, loc: LocalInk?, kA: FloatArray?, gsW: Int, gsH: Int,
+        ink: Mat, chPx: Double, lwF: Mat, colored: Mat?, r: Int,
+    ): Mat {
+        val h = g.rows()
+        val w = g.cols()
+        val lbl = Mat()
+        val st = Mat()
+        val cen = Mat()
+        val n = Imgproc.connectedComponentsWithStats(ink, lbl, st, cen, 8, CvType.CV_32S)
+        cen.release()
+        if (n < 2) {
+            lbl.release(); st.release(); return g
+        }
+        val stats = IntArray(n * 5).also { st.get(0, 0, it) }
+        st.release()
+        var ch = chPx
+        if (ch <= 0.0) {
+            val hs = ArrayList<Float>()
+            for (i in 1 until n) {
+                val hh = stats[i * 5 + 3]
+                if (hh >= 4 && hh < h * 0.05 && stats[i * 5 + 2] < w * 0.1) hs.add(hh.toFloat())
+            }
+            if (hs.size < 30) {
+                lbl.release(); return g
+            }
+            ch = percentile(hs.toFloatArray(), 50.0).toDouble()
+        }
+        // 글자 크기 덩어리(그림·큰 상자·긴 선은 제외) 근처만
+        val keep = BooleanArray(n) { i ->
+            i != 0 && stats[i * 5 + 3] >= 2 && stats[i * 5 + 3] <= 3.0 * ch && stats[i * 5 + 2] <= 10.0 * ch
+        }
+        var nk = 0
+        for (b in keep) if (b) nk++
+        if (nk < 10) {
+            lbl.release(); return g
+        }
+        val labels = IntArray(h * w).also { lbl.get(0, 0, it) }
+        lbl.release()
+        val tx8 = Mat(h, w, CvType.CV_8UC1).also { m -> m.put(0, 0, ByteArray(h * w) { if (keep[labels[it]]) 255.toByte() else 0 }) }
+        Imgproc.dilate(tx8, tx8, ellipse(2 * r + 1))
+        val txw = Mat()
+        tx8.convertTo(txw, CvType.CV_32F, 1.0 / 255.0)
+        tx8.release()
+        Imgproc.GaussianBlur(txw, txw, Size(0.0, 0.0), max(1.0, r / 2.0))
+        val one = Mat()
+        lwF.convertTo(one, CvType.CV_32F, -1.0, 1.0) // 1 - lw
+        Core.multiply(txw, one, txw)
+        if (colored != null) {
+            colored.convertTo(one, CvType.CV_32F, -1.0, 1.0)
+            Core.multiply(txw, one, txw)
+        }
+        one.release()
+        // 자리마다 글자 검정(진하기 맞춤 뒤): lv' = paper - (paper - lv) * k, 최대 paper - 30
+        var lvFull = Mat()
+        if (loc != null && kA != null) {
+            val lvS = Mat(gsH, gsW, CvType.CV_32F).also { it.put(0, 0, FloatArray(loc.lv.size) { i ->
+                min(paper - (paper - loc.lv[i]) * kA[i], paper - 30.0).toFloat()
+            }) }
+            Imgproc.resize(lvS, lvFull, Size(w.toDouble(), h.toDouble()), 0.0, 0.0, Imgproc.INTER_LINEAR)
+            lvS.release()
+        } else {
+            lvFull = Mat(h, w, CvType.CV_32F, Scalar(min(black, paper - 30.0)))
+        }
+        val sd = (STROKE_SMOOTH_CH * ch).coerceIn(0.6, 2.0)
+        val gd = Mat()
+        Imgproc.bilateralFilter(g, gd, 0, STROKE_SMOOTH_COLOR, sd)
+        // t = clip((gd - lv') / max(paper - lv', 1), 0, 1)
+        val den = Mat()
+        lvFull.convertTo(den, CvType.CV_32F, -1.0, paper)
+        Core.max(den, Scalar(1.0), den)
+        val t = Mat()
+        Core.subtract(gd, lvFull, t)
+        gd.release()
+        Core.divide(t, den, t)
+        Core.max(t, Scalar(0.0), t)
+        Core.min(t, Scalar(1.0), t)
+        // z = (σ((t - mid)·a) - z0) / (z1 - z0),  σ(x) = 1/(1+e^-x)
+        val a = STROKE_SLOPE * 4.0
+        val z0 = 1.0 / (1.0 + exp(STROKE_MID * a))
+        val z1 = 1.0 / (1.0 + exp(-(1.0 - STROKE_MID) * a))
+        val z = Mat()
+        t.convertTo(z, CvType.CV_32F, -a, STROKE_MID * a) // -(t - mid)·a
+        t.release()
+        Core.exp(z, z)
+        Core.add(z, Scalar(1.0), z)
+        Core.divide(1.0, z, z)
+        z.convertTo(z, CvType.CV_32F, 1.0 / (z1 - z0), -z0 / (z1 - z0))
+        Core.max(z, Scalar(0.0), z)
+        Core.min(z, Scalar(1.0), z)
+        // gr = lv' + (paper - lv') * z ;  out = g + (gr - g) * txw
+        Core.multiply(den, z, den)
+        z.release()
+        Core.add(den, lvFull, den)
+        lvFull.release()
+        Core.subtract(den, g, den)
+        Core.multiply(den, txw, den)
+        txw.release()
+        val out = Mat()
+        Core.add(g, den, out)
+        den.release()
+        return out
+    }
+
     private fun toneMap(norm: Mat, bgSmall: Mat? = null): Mat {
         val color = norm.channels() == 3
         val h = norm.rows()
@@ -1363,8 +1473,10 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         g8.convertTo(gF0, CvType.CV_32F) // 원래 밝기 (색 처리에서 L + (y - g) 의 g)
         // ---- 초점이 흐린 곳 선명하게: 글자 가장자리의 기울기(선명도)를 자리마다 재서, 흐린 곳일수록 강하게 언샤프
         //      (흐려진 획은 넓고 옅다. 대비만 키우면 굵고 뭉개진 글자가 되므로 먼저 획을 좁혀 세운다)
+        var chPx = 0.0 // 글자 높이(px). 0 이면 못 잼
         run {
-            val (shM, chPx) = localSharpness(g8, gF0)
+            val (shM, chPx0) = localSharpness(g8, gF0)
+            chPx = chPx0
             if (shM != null) {
                 val amt = Mat()
                 Imgproc.resize(shM, amt, Size(w.toDouble(), h.toDouble()), 0.0, 0.0, Imgproc.INTER_LINEAR)
@@ -1448,9 +1560,11 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         val gFs = Mat()
         g8.convertTo(gFs, CvType.CV_32F) // 선명하게 한 밝기 (글자 진하기 맞춤의 바탕)
         var gN = gFs
+        var kAll: FloatArray? = null // 글자 진하기 배율(1000px 축척). 획 되살리기에서 자리마다 글자 검정을 구할 때 씀
         if (loc != null) {
             // 종이에서 떨어진 거리를 k 배: 그 칸의 글자 검정(lv)이 전체 글자 검정(ref) 자리로 온다. 옅은 곳만(k ≥ 1)
             val kA = FloatArray(loc.lv.size) { ((paper - loc.ref) / max(paper - loc.lv[it], 1.0)).coerceIn(1.0, loc.smax[it].toDouble()).toFloat() }
+            kAll = kA
             var kMax = 1f
             for (v in kA) kMax = max(kMax, v)
             if (kMax > 1.02f) {
@@ -1525,7 +1639,6 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         val r = max(2, (w * INK_NEAR).toInt())
         val keep = Mat()
         Imgproc.dilate(ink, keep, ellipse(2 * r + 1))
-        ink.release()
         Imgproc.dilate(lines, tmp8, ellipse(5))
         Core.bitwise_or(keep, tmp8, keep)
         // 색: 종이 색(누런 기)을 뺀 채도. 색 상자·그림·색 글씨 근처는 지우지 않는다
@@ -1556,6 +1669,32 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         Imgproc.GaussianBlur(wv, wv, Size(0.0, 0.0), max(1.0, r / 2.0))
         wv.convertTo(wv, CvType.CV_32F, paper * (WHITE_TEXT - WHITE_BG), paper * WHITE_BG - black)
         Core.max(wv, Scalar(1.0), wv)
+        // 긴 선 가중치 lw = blur(dilate(lines)) (0~1): S자 곡선과 획 되살리기에서 선 위는 제외
+        val lwF = Mat()
+        Imgproc.dilate(lines, tmp8, rectK(3, 3))
+        lines.release()
+        tmp8.convertTo(lwF, CvType.CV_32F, 1.0 / 255.0)
+        Imgproc.GaussianBlur(lwF, lwF, Size(0.0, 0.0), 1.0)
+        // 색 처리용: colored = clip((chroma - K/2)/K, 0, 1) — 색이 있는 곳만 색을 남김
+        // (검은 글자의 가장자리 색 번짐은 무채색으로). 순수한 흰색은 '색이 없는' 종이 부분만
+        var fade: Mat? = null
+        if (color) {
+            val col = Mat()
+            chroma!!.convertTo(col, CvType.CV_32F, 1.0 / CHROMA_KEEP, -0.5)
+            Core.max(col, Scalar(0.0), col)
+            Core.min(col, Scalar(1.0), col)
+            fade = col
+        }
+        // ---- 획 모양 되살리기: 흐려진 획은 넓고 옅다. 잡음을 살짝 누른 뒤 자리마다 (글자 검정 ~ 종이) 한가운데를
+        //      중심으로 가파른 S-곡선 → 가장자리가 원래 자리에서 서고 획 폭이 원래대로. 글자 크기 덩어리 근처에서만
+        run {
+            val gR = restoreStrokes(gN, paper, black, loc, kAll, gsW, gsH, ink, chPx, lwF, fade, r)
+            if (gR !== gN) {
+                if (gN !== gFs) gN.release()
+                gN = gR
+            }
+        }
+        ink.release()
         // t = clip((g - black) / (white - black), 0, 1)   (g 는 글자 진하기를 맞춘 것)
         g8.release()
         val t = Mat()
@@ -1572,30 +1711,20 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         val white8 = Mat()
         white.convertTo(white8, CvType.CV_8U)
         white.release()
-        // 색 처리용: colored = clip((chroma - K/2)/K, 0, 1) — 색이 있는 곳만 색을 남김
-        // (검은 글자의 가장자리 색 번짐은 무채색으로). 순수한 흰색은 '색이 없는' 종이 부분만
-        var fade: Mat? = null
         if (color) {
-            val col = Mat()
-            chroma!!.convertTo(col, CvType.CV_32F, 1.0 / CHROMA_KEEP, -0.5)
-            Core.max(col, Scalar(0.0), col)
-            Core.min(col, Scalar(1.0), col)
-            fade = col
             val colMask = Mat()
             Imgproc.threshold(chroma, colMask, CHROMA_KEEP * 0.5, 255.0, Imgproc.THRESH_BINARY)
             colMask.convertTo(tmp8, CvType.CV_8U)
             colMask.release()
             Core.subtract(white8, tmp8, white8) // (t >= 1) 이면서 색이 없는 곳
-            chroma.release()
+            chroma!!.release()
         }
         // 곡선: 감마(글자 진하게)와 S자 곡선 t²(3-2t)(글자 둘레의 옅은 얼룩·비침을 흰색 쪽으로)을 섞는다.
         // 상자 테두리·밑줄 같은 옅은 긴 선 위에서는 S자를 쓰지 않는다(옅은 선이 사라지지 않게).
         //   sm = S_MIX * (1 - blur(dilate(lines)))  ;  u = t + sm * (S(t) - t)
         val sm = Mat()
-        Imgproc.dilate(lines, tmp8, rectK(3, 3))
-        lines.release()
-        tmp8.convertTo(sm, CvType.CV_32F, -S_MIX / 255.0, S_MIX)
-        Imgproc.GaussianBlur(sm, sm, Size(0.0, 0.0), 1.0)
+        lwF.convertTo(sm, CvType.CV_32F, -S_MIX, S_MIX)
+        lwF.release()
         val u = Mat()
         t.convertTo(u, CvType.CV_32F, -2.0, 3.0)
         Core.multiply(u, t, u)
@@ -2037,6 +2166,11 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         const val PRE_SHARPEN_SIGMA_CH = 0.1
         const val SHARP_CELL = 1.0 / 10
         const val SHARP_MIN_EDGE = 300
+        // 획 모양 되살리기 (engine/bookscan.py STROKE_* 와 같은 값)
+        const val STROKE_SLOPE = 3.0
+        const val STROKE_MID = 0.5
+        const val STROKE_SMOOTH_CH = 0.09
+        const val STROKE_SMOOTH_COLOR = 20.0
         // 글자 진하기 자리마다 맞춤 (engine/bookscan.py LOCAL_* / GLARE_* 와 같은 값)
         const val LOCAL_CELL = 1.0 / 12
         const val LOCAL_PCT = 5.0

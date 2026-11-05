@@ -957,6 +957,11 @@ PRE_SHARPEN_MAX = 2.5     # 언샤프 최대 세기
 PRE_SHARPEN_SIGMA_CH = 0.1  # 언샤프 반경 = 글자 높이 × 이 값 (1~2.5px)
 SHARP_CELL = 1.0 / 10     # 선명도 지도의 칸 크기(페이지 폭 비율)
 SHARP_MIN_EDGE = 300      # 칸에 글자 가장자리 픽셀이 이보다 적으면 비움
+# 획 모양 되살리기: 흐려져 넓고 옅어진 획을 원래 폭의 또렷한 획으로(글자 덩어리 근처에서만)
+STROKE_SLOPE = 3.0        # (글자 검정~종이) 사이 중간값을 중심으로 한 S-곡선의 중간 기울기 (1 = 그대로)
+STROKE_MID = 0.5          # 곡선 중심 (0.5 = 종이와 글자 검정의 한가운데: 흐려진 대칭 가장자리의 원래 자리)
+STROKE_SMOOTH_CH = 0.09   # 곡선 전에 잡음을 누르는 양방향 필터의 공간 σ = 글자 높이 × 이 값 (0.6~2px)
+STROKE_SMOOTH_COLOR = 20.0  # 양방향 필터의 밝기 σ (이보다 밝기 차가 큰 가장자리는 뭉개지 않음)
 
 
 def local_sharpness(g):
@@ -1010,6 +1015,51 @@ def local_sharpness(g):
     sm = sm * np.minimum(den / 0.3, 1.0) + ref * (1.0 - np.minimum(den / 0.3, 1.0))
     sm = cv2.resize(sm, (gw * cell, gh * cell), interpolation=cv2.INTER_LINEAR)[:h, :w]
     return sm, ch
+
+
+def restore_strokes(g, paper, black, loc, k, s, ink, ch_px, lw, colored, r):
+    """
+    흐려진 획 되살리기 (tone_map 안에서 씀). g: 글자 진하기 맞춤이 끝난 밝기, loc: local_ink_level 결과(없으면 None),
+    k: 그 배율 지도(1000px 축척), ink: 글자 후보(g < paper·INK_DARK), ch_px: 글자 높이(없으면 ink 에서 잼),
+    lw: 긴 선 가중치, colored: 색 가중치(없으면 None), r: 글자 근처 반경
+    """
+    h, w = g.shape
+    n, lbl, st, _ = cv2.connectedComponentsWithStats(ink, 8)
+    if n < 2:
+        return g
+    hs, ws = st[:, cv2.CC_STAT_HEIGHT], st[:, cv2.CC_STAT_WIDTH]
+    if ch_px is None:
+        okc = (hs >= 4) & (hs < h * 0.05) & (ws < w * 0.1)
+        okc[0] = False
+        if okc.sum() < 30:
+            return g
+        ch_px = float(np.median(hs[okc]))
+    # 글자 크기 덩어리(그림·큰 상자·긴 선은 제외) 근처만
+    kp = (hs >= 2) & (hs <= 3.0 * ch_px) & (ws <= 10.0 * ch_px)
+    kp[0] = False
+    if kp.sum() < 10:
+        return g
+    tx = cv2.dilate(kp[lbl].astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1)))
+    txw = cv2.GaussianBlur(tx.astype(np.float32), (0, 0), max(1.0, r / 2.0)) * (1.0 - lw)
+    if colored is not None:
+        txw *= 1.0 - colored
+    # 자리마다 글자 검정: 진하기 맞춤(k)이 끝난 뒤의 값. 없으면 전체 글자 검정
+    if loc is not None:
+        lv, ref, smax = loc
+        lv_s = np.minimum(paper - (paper - lv) * k, paper - 30.0).astype(np.float32)
+        lv_full = cv2.resize(lv_s, (w, h), interpolation=cv2.INTER_LINEAR) if s < 1 else lv_s
+    else:
+        lv_full = np.full_like(g, min(black, paper - 30.0))
+    sd = float(np.clip(STROKE_SMOOTH_CH * ch_px, 0.6, 2.0))
+    gd = cv2.bilateralFilter(g, 0, STROKE_SMOOTH_COLOR, sd)
+    t = np.clip((gd - lv_full) / np.maximum(paper - lv_full, 1.0), 0, 1)
+    a = STROKE_SLOPE * 4.0
+    z = 1.0 / (1.0 + np.exp(-(t - STROKE_MID) * a))
+    z0 = 1.0 / (1.0 + np.exp(STROKE_MID * a))
+    z1 = 1.0 / (1.0 + np.exp(-(1.0 - STROKE_MID) * a))
+    z = np.clip((z - z0) / (z1 - z0), 0, 1)
+    gr = lv_full + (paper - lv_full) * z
+    return g * (1.0 - txw) + gr * txw
 
 
 def tone_map(norm, bg=None):
@@ -1094,10 +1144,18 @@ def tone_map(norm, bg=None):
         keep |= (chroma > CHROMA_KEEP).astype(np.uint8)
     near = cv2.GaussianBlur(keep.astype(np.float32), (0, 0), max(1.0, r / 2.0))
     white = paper * (WHITE_BG + (WHITE_TEXT - WHITE_BG) * near)
+    lw = cv2.GaussianBlur(cv2.dilate(lines, np.ones((3, 3), np.uint8)).astype(np.float32), (0, 0), 1.0)
+    colored = None
+    if color:
+        colored = np.clip((chroma - CHROMA_KEEP * 0.5) / CHROMA_KEEP, 0, 1)
+    # ---- 획 모양 되살리기: 흐려진 획은 넓고 옅다(가장자리가 완만한 경사). 잡음을 살짝 누른 뒤, 자리마다
+    #      (글자 검정 ~ 종이) 한가운데를 중심으로 가파른 S-곡선을 먹이면 가장자리가 원래 자리(대칭 흐림의 50% 지점)에서
+    #      서므로 획 폭이 원래대로 돌아오고 가장자리는 매끈하게 또렷해진다. 글자 크기 덩어리 근처에서만
+    #      (그림·큰 덩어리·긴 선·색 있는 곳은 그대로).
+    g = restore_strokes(g, paper, black, loc, k if loc is not None else None, s, ink, ch_px, lw, colored, r)
     t = np.clip((g - black) / np.maximum(white - black, 1.0), 0, 1)
     # 곡선: 감마(글자 진하게)와 S자 곡선(글자 둘레의 옅은 얼룩·비침을 흰색 쪽으로)을 섞는다.
     # 상자 테두리·밑줄 같은 옅은 긴 선 위에서는 S자를 쓰지 않는다(옅은 선이 사라지지 않게).
-    lw = cv2.GaussianBlur(cv2.dilate(lines, np.ones((3, 3), np.uint8)).astype(np.float32), (0, 0), 1.0)
     sm = S_MIX * (1.0 - lw)
     u = (1.0 - sm) * t + sm * (t * t * (3.0 - 2.0 * t))
     y = BLACK_OUT + (255.0 - BLACK_OUT) * u ** TONE_GAMMA
@@ -1105,7 +1163,6 @@ def tone_map(norm, bg=None):
         # 밝기는 톤 곡선대로, 색(a, b)은 종이 색을 빼고 조금 진하게. 종이 부분은 순수한 흰색.
         # (RGB 에 같은 비율을 곱하면 밝은 색이 255 에서 잘려 색이 바래므로 Lab 에서 처리)
         # 색이 있는 곳만 색을 남긴다. 검은 글자의 가장자리 색 번짐(카메라 색수차)은 무채색으로
-        colored = np.clip((chroma - CHROMA_KEEP * 0.5) / CHROMA_KEEP, 0, 1)
         Lp = lab[..., 0] + (y - g0)
         ap = 128.0 + (lab[..., 1] - a_p) * (COLOR_SAT * colored)
         bp = 128.0 + (lab[..., 2] - b_p) * (COLOR_SAT * colored)

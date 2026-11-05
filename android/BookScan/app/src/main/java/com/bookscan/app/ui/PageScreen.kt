@@ -37,6 +37,7 @@ import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -58,6 +59,7 @@ import com.bookscan.app.data.ImageIO
 import com.bookscan.app.data.ScanPage
 import com.bookscan.app.engine.ColorMode
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.min
 
@@ -65,6 +67,7 @@ import kotlin.math.min
 @Composable
 fun PageScreen(vm: MainViewModel, page: ScanPage, onBack: () -> Unit) {
     val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
     val index = vm.pages.indexOfFirst { it.id == page.id }
     var eraser by remember { mutableStateOf(false) }
     val strokes = remember { mutableStateListOf<List<Offset>>() }
@@ -81,20 +84,24 @@ fun PageScreen(vm: MainViewModel, page: ScanPage, onBack: () -> Unit) {
                 title = { Text("${index + 1} / ${vm.pages.size}") },
                 navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "목록") } },
                 actions = {
-                    val raw = page.rawFile
-                    if (raw != null) {
+                    if (page.rawFile != null) {
                         IconButton(onClick = {
-                            // 엔진에 넣은 원본 사진 공유 (결과가 이상할 때 사진째 보내 확인)
-                            runCatching {
-                                val uri = FileProvider.getUriForFile(ctx, ctx.packageName + ".fileprovider", raw)
-                                val send = Intent(Intent.ACTION_SEND).apply {
-                                    type = "image/jpeg"
-                                    putExtra(Intent.EXTRA_STREAM, uri)
-                                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                                }
-                                ctx.startActivity(Intent.createChooser(send, "원본 사진 공유"))
-                            }.onFailure { vm.message = "원본 사진 공유 실패: ${it.message}" }
-                        }) { Icon(Icons.Filled.PhotoCamera, "원본 사진 공유") }
+                            // 엔진에 넣은 원본 사진 + 결과를 PDF 한 장으로 공유 (결과가 이상할 때 원본 해상도 그대로 보내 확인)
+                            scope.launch {
+                                val file = runCatching { vm.exportDiagnosticPdf(page) }
+                                    .onFailure { vm.message = "확인용 PDF 만들기 실패: ${it.message}" }
+                                    .getOrNull() ?: return@launch
+                                runCatching {
+                                    val uri = FileProvider.getUriForFile(ctx, ctx.packageName + ".fileprovider", file)
+                                    val send = Intent(Intent.ACTION_SEND).apply {
+                                        type = "application/pdf"
+                                        putExtra(Intent.EXTRA_STREAM, uri)
+                                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                    }
+                                    ctx.startActivity(Intent.createChooser(send, "원본+결과 PDF 공유 (확인용)"))
+                                }.onFailure { vm.message = "공유 실패: ${it.message}" }
+                            }
+                        }) { Icon(Icons.Filled.PhotoCamera, "원본+결과 PDF 공유 (확인용)") }
                     }
                     IconButton(onClick = { vm.delete(page); onBack() }) { Icon(Icons.Filled.Delete, "이 페이지 삭제") }
                 },
