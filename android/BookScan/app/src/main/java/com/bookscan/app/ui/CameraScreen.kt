@@ -289,6 +289,7 @@ private fun CameraContent(vm: MainViewModel, onOpenReview: () -> Unit) {
         }
     }
 
+    LaunchedEffect(Unit) { vm.firstTip()?.let { vm.message = it } }
     // HDR 켜기/끄기를 바꾸면 카메라만 다시 연다(아래 DisposableEffect 가 채워 줌)
     val rebind = remember { mutableStateOf<((Boolean) -> Unit)?>(null) }
     LaunchedEffect(vm.hdrCapture) { rebind.value?.invoke(vm.hdrCapture) }

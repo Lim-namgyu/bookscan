@@ -76,6 +76,13 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
     /** 실제로 HDR 이 적용되어 카메라가 열렸는지 (화면 표시용) */
     var hdrActive by mutableStateOf(false)
 
+    /** 처음 한 번만 보여 주는 촬영 요령 */
+    fun firstTip(): String? {
+        if (prefs.getBoolean("tipShown", false)) return null
+        prefs.edit().putBoolean("tipShown", true).apply()
+        return "촬영 요령: 책을 화면에 꽉 채우고 초록 테두리가 뜰 때 찍으세요. 글자가 작은 책은 한 쪽씩 가까이 찍으면 가장 선명합니다"
+    }
+
     fun setHdrCaptureOn(on: Boolean) {
         hdrCapture = on
         prefs.edit().putBoolean("hdrCapture", on).apply()
