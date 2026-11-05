@@ -122,7 +122,7 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
                         val result = eng.clean(dp.flat, mode, fingers, dp.skipSide)
                         dp.flat.release()
                         val resultFile = File(sessionDir, "${id}_v0.jpg")
-                        ImageIO.saveMatJpeg(result, resultFile, 92)
+                        ImageIO.saveMatJpeg(result, resultFile, RESULT_JPEG_Q)
                         result.release()
                         ScanPage(id, flatFile, resultFile, dp.skipSide, mode, fingers, rawFile = rawFile.takeIf { it.exists() })
                     }
@@ -191,7 +191,7 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
             flat.release()
             val v = p.version + 1
             val file = File(sessionDir, "${p.id}_v$v.jpg")
-            ImageIO.saveMatJpeg(out, file, 92)
+            ImageIO.saveMatJpeg(out, file, RESULT_JPEG_Q)
             out.release()
             p.resultFile.delete()
             p.copy(resultFile = file, mode = mode, removeFingers = fingers, version = v)
@@ -204,7 +204,7 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
             val v = p.version + 1
             val file = File(sessionDir, "${p.id}_v$v.jpg")
             p.resultFile.copyTo(file, overwrite = true)
-            ImageIO.rotateFile90(file, 92)
+            ImageIO.rotateFile90(file, RESULT_JPEG_Q)
             p.resultFile.delete()
             // 돌리면 접힌 선 위치가 바뀌므로 손가락 검사 제외 방향은 해제
             p.copy(resultFile = file, version = v, skipSide = null)
@@ -239,7 +239,7 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
                 }
                 val v = p.version + 1
                 val file = File(sessionDir, "${p.id}_v$v.jpg")
-                ImageIO.saveBitmapJpeg(bmp, file, 92)
+                ImageIO.saveBitmapJpeg(bmp, file, RESULT_JPEG_Q)
                 bmp.recycle()
                 p.resultFile.delete()
                 p.copy(resultFile = file, version = v)
@@ -319,6 +319,9 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
     }
 
     companion object {
+        /** 결과 JPEG 품질. 또렷한 글자 가장자리에 JPEG 잡음(모기 소음)이 보이지 않는 수준 (92 는 4배 확대에서 보임) */
+        const val RESULT_JPEG_Q = 95
+
         /** 촬영 사진을 엔진에 넣기 전 줄일 크기(긴 변) */
         fun targetScale(w: Int, h: Int): Float =
             (BookScanEngine.MAX_SIDE.toFloat() / max(w, h)).coerceAtMost(1f)
