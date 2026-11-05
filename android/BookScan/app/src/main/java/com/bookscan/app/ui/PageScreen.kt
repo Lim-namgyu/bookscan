@@ -4,6 +4,11 @@ import android.content.Intent
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.rememberTransformableState
+import androidx.compose.foundation.gestures.transformable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -163,10 +168,29 @@ fun PageScreen(vm: MainViewModel, page: ScanPage, onBack: () -> Unit) {
     ) { padding ->
         Column(Modifier.padding(padding).fillMaxSize()) {
             if (vm.processing > 0) LinearProgressIndicator(Modifier.fillMaxWidth())
+            // 손가락 두 개로 확대·이동, 두 번 탭하면 원래대로 (지우개 모드에서는 끔)
+            var zoom by remember { mutableStateOf(1f) }
+            var pan by remember { mutableStateOf(Offset.Zero) }
+            val transform = rememberTransformableState { zoomChange, panChange, _ ->
+                val nz = (zoom * zoomChange).coerceIn(1f, 8f)
+                zoom = nz
+                pan = if (nz <= 1f) Offset.Zero else pan + panChange
+            }
+            LaunchedEffect(eraser, page.version) { zoom = 1f; pan = Offset.Zero }
             Box(
                 Modifier.fillMaxSize().background(Color(0xFF0C0C0C)).onSizeChanged { boxSize = it }
+                    .then(
+                        if (eraser) Modifier else Modifier
+                            .transformable(transform)
+                            .pointerInput(Unit) { detectTapGestures(onDoubleTap = { zoom = 1f; pan = Offset.Zero }) }
+                    )
             ) {
-                PageImage(page.resultFile, page.version, 2048, Modifier.fillMaxSize())
+                PageImage(
+                    page.resultFile, page.version, 4096,
+                    Modifier.fillMaxSize().graphicsLayer {
+                        scaleX = zoom; scaleY = zoom; translationX = pan.x; translationY = pan.y
+                    },
+                )
                 if (eraser) {
                     Canvas(
                         Modifier.fillMaxSize().pointerInput(Unit) {
