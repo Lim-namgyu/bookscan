@@ -1043,7 +1043,12 @@ def restore_strokes(g, paper, black, loc, k, s, ink, ch_px, lw, colored, r):
     tx = cv2.dilate(kp[lbl].astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1)))
     txw = cv2.GaussianBlur(tx.astype(np.float32), (0, 0), max(1.0, r / 2.0)) * (1.0 - lw)
     if colored is not None:
-        txw *= 1.0 - colored
+        # 색은 '면'(색 상자·형광펜·그림)만 제외하고 색 글씨(가는 획)는 살린다: 획 굵기보다 큰 열림 연산을 통과하는 곳이 면
+        kf = max(3, int(0.6 * ch_px)) | 1
+        fill = cv2.morphologyEx((colored > 0.5).astype(np.uint8), cv2.MORPH_OPEN,
+                                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kf, kf)))
+        fill = cv2.GaussianBlur(cv2.dilate(fill, np.ones((kf, kf), np.uint8)).astype(np.float32), (0, 0), 2.0)
+        txw *= 1.0 - np.clip(fill, 0, 1)
     # 자리마다 글자 검정: 진하기 맞춤(k)이 끝난 뒤의 값. 없으면 전체 글자 검정
     if loc is not None:
         lv, ref, smax = loc

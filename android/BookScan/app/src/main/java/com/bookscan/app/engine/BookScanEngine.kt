@@ -1425,7 +1425,16 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         lwF.convertTo(one, CvType.CV_32F, -1.0, 1.0) // 1 - lw
         Core.multiply(txw, one, txw)
         if (colored != null) {
-            colored.convertTo(one, CvType.CV_32F, -1.0, 1.0)
+            // 색은 '면'(색 상자·형광펜·그림)만 제외하고 색 글씨(가는 획)는 살린다: 획 굵기보다 큰 열림 연산을 통과하는 곳이 면
+            val kf = max(3, (0.6 * ch).toInt()) or 1
+            val fill = Mat()
+            Imgproc.threshold(colored, fill, 0.5, 255.0, Imgproc.THRESH_BINARY)
+            fill.convertTo(fill, CvType.CV_8U)
+            Imgproc.morphologyEx(fill, fill, Imgproc.MORPH_OPEN, ellipse(kf))
+            Imgproc.dilate(fill, fill, rectK(kf, kf))
+            fill.convertTo(one, CvType.CV_32F, -1.0 / 255.0, 1.0) // 1 - fill
+            fill.release()
+            Imgproc.GaussianBlur(one, one, Size(0.0, 0.0), 2.0)
             Core.multiply(txw, one, txw)
         }
         one.release()
