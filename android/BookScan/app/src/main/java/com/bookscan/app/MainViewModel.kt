@@ -18,6 +18,7 @@ import com.bookscan.app.engine.BookScanEngine
 import com.bookscan.app.engine.ColorMode
 import com.bookscan.app.engine.Layout
 import com.bookscan.app.export.PdfExporter
+import com.bookscan.app.ocr.PageOcr
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.asCoroutineDispatcher
@@ -116,12 +117,38 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
                     }
                 }
                 pages.addAll(newPages)
+                newPages.forEach { queueOcr(it.id) }
             } catch (t: Throwable) {
                 message = "처리 실패: ${t.message}"
             } finally {
                 processing--
             }
         }
+    }
+
+    // ---- OCR(검색 가능한 PDF 용 글자층): 페이지가 생기거나 바뀌면 뒤에서 읽어 둔다. 실패해도 스캔에는 영향 없음
+    private fun queueOcr(id: Long) {
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                val cur = pages.firstOrNull { it.id == id } ?: return@launch
+                if (cur.ocrFile != null) return@launch
+                val lines = PageOcr.recognize(cur.resultFile)
+                val f = File(sessionDir, "${cur.id}_v${cur.version}_ocr.json")
+                PageOcr.save(lines, f)
+                withContext(Dispatchers.Main) {
+                    editLock.withLock {
+                        val now = pages.firstOrNull { it.id == id } ?: return@withLock
+                        if (now.version == cur.version && now.resultFile == cur.resultFile) replace(now.copy(ocrFile = f))
+                    }
+                }
+            }
+        }
+    }
+
+    /** PDF 만들 때: 아직 안 읽은 페이지는 그 자리에서 읽는다 */
+    private fun ocrLines(p: ScanPage): List<com.bookscan.app.ocr.OcrLine> {
+        p.ocrFile?.let { return PageOcr.load(it) }
+        return runCatching { PageOcr.recognize(p.resultFile) }.getOrDefault(emptyList())
     }
 
     // 페이지 편집(다시 보정·회전·지우개)은 한 번에 하나씩, 항상 최신 페이지 상태 기준으로
@@ -133,8 +160,9 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
             try {
                 editLock.withLock {
                     val cur = pages.firstOrNull { it.id == id } ?: return@withLock
-                    replace(block(cur))
+                    replace(block(cur).copy(ocrFile = null)) // 결과가 바뀌었으니 글자도 다시 읽는다
                 }
+                queueOcr(id)
             } catch (t: Throwable) {
                 message = "$label 실패: ${t.message}"
             } finally {
@@ -212,6 +240,7 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
         pages.removeAll { it.id == page.id }
         page.flatFile.delete()
         page.resultFile.delete()
+        page.ocrFile?.delete()
     }
 
     fun clearAll() {
@@ -228,7 +257,7 @@ class MainViewModel(private val app: Application) : AndroidViewModel(app) {
             dir.listFiles()?.forEach { it.delete() }
             val dest = File(dir, name)
             val imgs = snapshot.mapNotNull { p ->
-                ImageIO.imageSize(p.resultFile)?.let { (w, h) -> PdfExporter.Img(p.resultFile, w, h) }
+                ImageIO.imageSize(p.resultFile)?.let { (w, h) -> PdfExporter.Img(p.resultFile, w, h, ocrLines(p)) }
             }
             PdfExporter.write(imgs, dest)
             ImageIO.saveToDownloads(app, dest, name)

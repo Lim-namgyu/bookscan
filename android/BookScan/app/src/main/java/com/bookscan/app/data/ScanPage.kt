@@ -20,4 +20,6 @@ data class ScanPage(
     val version: Int = 0,
     /** 엔진에 넣은 원본 사진(똑바로 세우고 크기만 줄인 것). 결과가 이상할 때 사진째 보내 볼 수 있게 */
     val rawFile: File? = null,
+    /** 결과 이미지의 OCR 글줄(JSON). 없으면 아직 안 읽은 것 → PDF 만들 때 읽음 */
+    val ocrFile: File? = null,
 )

@@ -76,6 +76,9 @@ dependencies {
     implementation("androidx.camera:camera-lifecycle:$camerax")
     implementation("androidx.camera:camera-view:$camerax")
 
+    // 글자 읽기(OCR, 온디바이스 한국어·영어): 검색 가능한 PDF 의 글자층
+    implementation("com.google.mlkit:text-recognition-korean:16.0.1")
+
     // 영상 처리 / 곡면 펴기 모델
     implementation("org.opencv:opencv:4.10.0")
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
