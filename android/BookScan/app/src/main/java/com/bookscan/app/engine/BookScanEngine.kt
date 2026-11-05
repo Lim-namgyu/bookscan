@@ -2274,7 +2274,7 @@ class BookScanEngine(modelBytes: ByteArray, regionModelBytes: ByteArray? = null)
         const val SHARPEN = 0.0         // 마지막 언샤프 마스크 세기. 획 되살리기가 가장자리를 세우므로 끔(켜면 울퉁불퉁해짐)
         const val SHARPEN_SIGMA = 1.0
         const val BW_T = 140.0          // 흑백 모드: 톤 보정 후 이보다 어두우면 검정
-        const val BW_UPSCALE_BELOW = 1600 // 흑백 모드: 페이지 폭이 이보다 작으면 2배로 키워서 자름
+        const val BW_UPSCALE_BELOW = 100000 // 흑백 모드: 페이지 폭이 이보다 작으면 2배로 키워서 자른 뒤 줄임(가장자리 계단 없음). 항상
         const val ERASE_LIGHT = 200.0   // 손가락 주변 띠에서 이보다 밝은 것(남은 옅은 그림자)만 흰색으로
 
         /** 글줄 분석 해상도(긴 변) */
